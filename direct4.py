@@ -160,36 +160,53 @@ def load_displacement_field_mha(mha_path):
         print("  SimpleITK not available - cannot load .mha files")
         return None
 
-def apply_displacement_field_to_color_image(color_image, displacement_field):
+def apply_displacement_field_patchwise(color_image, displacement_field, patch_size=4096):
     """
-    Apply displacement field to color image using OpenCV remap
+    Apply displacement field to large color image using patchwise remapping
+    Avoids OpenCV SHRT_MAX size limitation
+
+    Args:
+        color_image: np.array (H, W, 3)
+        displacement_field: np.array (H, W, 2)
+        patch_size: int, tile size (default: 4096)
+    Returns:
+        warped_image: np.array (H, W, 3)
     """
-    print(f"  Applying displacement field to color image...")
-    print(f"  Image shape: {color_image.shape}")
-    print(f"  Displacement field shape: {displacement_field.shape}")
-    
-    h, w = color_image.shape[:2]
-    dh, dw = displacement_field.shape[:2]
-    
-    if (h != dh) or (w != dw):
-        print(f"  ⚠️ Resizing displacement field from ({dh}, {dw}) to ({h}, {w})")
-        # Resize each channel separately
-        resized_field = np.zeros((h, w, 2), dtype=np.float32)
-        for i in range(2):
-            resized_field[:, :, i] = cv2.resize(displacement_field[:, :, i], (w, h), interpolation=cv2.INTER_LINEAR)
-        displacement_field = resized_field
+    print(f"🧩 Patchwise remapping with patch size: {patch_size}")
+    H, W = color_image.shape[:2]
+    warped_image = np.zeros_like(color_image)
 
-    # Create coordinate grids
-    x, y = np.meshgrid(np.arange(w), np.arange(h))
+    for y in range(0, H, patch_size):
+        for x in range(0, W, patch_size):
+            y_end = min(y + patch_size, H)
+            x_end = min(x + patch_size, W)
 
-    # Apply displacement
-    map_x = (x + displacement_field[:, :, 0]).astype(np.float32)
-    map_y = (y + displacement_field[:, :, 1]).astype(np.float32)
+            # Extract patches
+            img_patch = color_image[y:y_end, x:x_end]
+            disp_patch = displacement_field[y:y_end, x:x_end]
 
-    # Apply transformation
-    warped = cv2.remap(color_image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+            if disp_patch.shape[:2] != img_patch.shape[:2]:
+                print(f"⚠️ Shape mismatch at patch ({y}:{y_end}, {x}:{x_end})")
+                continue
 
-    return warped
+            # Build remap grid
+            grid_x, grid_y = np.meshgrid(np.arange(x_end - x), np.arange(y_end - y))
+            map_x = (grid_x + disp_patch[..., 0]).astype(np.float32)
+            map_y = (grid_y + disp_patch[..., 1]).astype(np.float32)
+
+            # Apply remap
+            try:
+                warped_patch = cv2.remap(
+                    img_patch, map_x, map_y,
+                    interpolation=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT
+                )
+                warped_image[y:y_end, x:x_end] = warped_patch
+            except cv2.error as e:
+                print(f"❌ Remap failed at patch ({y}:{y_end}, {x}:{x_end}): {e}")
+
+    return warped_image
+
 
 
 def find_displacement_field(reg_dir, temp_dir):
@@ -453,7 +470,7 @@ def register_qptiff_direct(he_qptiff_path: Path, if_qptiff_path: Path,
                 
                 if displacement_field is not None:
                     # Apply to original color image
-                    warped_color = apply_displacement_field_to_color_image(he_original_color, displacement_field)
+                    warped_color = apply_displacement_field_patchwise(he_original_color, displacement_field, patch_size=4096)
                     
                     # Save final color result
                     final_output_path = output_dir / "registered_HE_color.tiff"
