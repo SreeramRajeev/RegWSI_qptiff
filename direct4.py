@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Direct QPTIFF Registration Pipeline (RGB inputs)
-Feeds 3‑channel RGB into DeepHistReg so the warped output stays in color.
+Direct QPTIFF Registration Pipeline (RGB inputs, dynamic warped discovery)
+Feeds 3-channel RGB into DeepHistReg so the warped output stays in color.
 """
 
 import os, sys, time, shutil
@@ -58,7 +58,6 @@ def preprocess_for_registration(src: np.ndarray, tgt: np.ndarray):
 def create_registration_params() -> Dict:
     params = default_initial_nonrigid()
     # ---- your original feature + nonrigid + multires + optimization params here ----
-    # For brevity, paste exactly your working dict setup from before:
     params['initial_alignment_params'] = {
         'type': 'feature_based', 'detector': 'superpoint', 'matcher': 'superglue',
         'ransac_threshold': 10.0, 'max_features': 10000, 'match_ratio': 0.9,
@@ -107,17 +106,14 @@ def register_qptiff_direct(
     temp_dir = reg_dir/"TEMP";    temp_dir.mkdir(exist_ok=True)
     results: Dict = {}
 
-    # --- Step 1: load & extract IF→RGB ---
+    # Step 1: load & extract IF→RGB
     with tifffile.TiffFile(if_qptiff_path) as tif:
         if_data = tif.asarray()
-    # Handle 4D Z,C,Y,X → pick C-major
     if if_data.ndim == 4:
-        # assume shape (Z,C,Y,X) or (C,Z,Y,X)
         if if_data.shape[0] < if_data.shape[1]:
             if_data = if_data[0]
         else:
             if_data = if_data[:,0]
-    # Now if_data is C×Y×X or Y×X
     if if_data.ndim == 3 and if_data.shape[0] >= max(if_channels)+1:
         chans = []
         for ch in if_channels[:3]:
@@ -127,16 +123,14 @@ def register_qptiff_direct(
             chans.append(norm)
         if_rgb = np.stack(chans, axis=-1)
     else:
-        # fallback: interpret as Y×X×C
         if_rgb = if_data if if_data.ndim==3 else cv2.cvtColor(if_data, cv2.COLOR_GRAY2RGB)
     tifffile.imwrite(temp_dir/"if_rgb_temp.tiff", if_rgb, photometric='rgb', compression='lzw')
     target_shape = if_rgb.shape
 
-    # --- Step 2: load H&E original & preprocess RGB ---
+    # Step 2: load H&E original & preprocess RGB
     with tifffile.TiffFile(he_qptiff_path) as tif:
         he_page = tif.pages[0]
         he_data = he_page.asarray()
-    # H×W×C or C×H×W
     if he_data.ndim==3 and he_data.shape[0]==3:
         he_data = np.transpose(he_data, (1,2,0))
     if he_data.ndim==2:
@@ -147,12 +141,12 @@ def register_qptiff_direct(
         he_data = cv2.resize(he_data, (target_shape[1],target_shape[0]), interpolation=cv2.INTER_LINEAR)
     tifffile.imwrite(temp_dir/"he_rgb_temp.tiff", he_data, photometric='rgb', compression='lzw')
 
-    # --- Step 3: RGB preprocessing for registration ---
+    # Step 3: RGB preprocessing for registration
     he_prep, if_prep = preprocess_for_registration(he_data, if_rgb)
     tifffile.imwrite(reg_dir/"he_preprocessed.tiff", he_prep, photometric='rgb', compression='lzw')
     tifffile.imwrite(reg_dir/"if_preprocessed.tiff", if_prep, photometric='rgb', compression='lzw')
 
-    # --- Step 4: run DeepHistReg ---
+    # Step 4: run DeepHistReg
     params = create_registration_params()
     config = {
         'source_path': str(reg_dir/"he_preprocessed.tiff"),
@@ -170,17 +164,24 @@ def register_qptiff_direct(
     elapsed = time.time() - start
     print(f"   ✔ DeepHistReg took {elapsed:.1f}s")
 
-    # --- Step 5: grab the 3‑channel warped_source directly ---
-    warped = reg_dir/"qptiff_rgb_warped_source.tiff"
-    if not warped.exists():
-        warped = reg_dir/"qptiff_rgb/qptiff_rgb_warped_source.tiff"
-    if not warped.exists():
-        raise FileNotFoundError(f"No 3‑channel warped_source found in {reg_dir}")
-
+    # Step 5: discover & copy the 3-channel warped TIFF
+    warped_candidates = list(reg_dir.glob("**/*warped*.tif*"))
+    if not warped_candidates:
+        raise FileNotFoundError(f"No warped TIFF found in {reg_dir}")
+    print("   🔍 Found warped files:")
+    for p in warped_candidates:
+        print("    -", p)
+    warped_rgb_path = None
+    for p in warped_candidates:
+        img = tifffile.imread(str(p))
+        if img.ndim == 3 and img.shape[2] == 3:
+            warped_rgb_path = p
+            break
+    if warped_rgb_path is None:
+        raise RuntimeError("Found warped files but none are 3-channel RGB")
     final_out = output_dir/"registered_HE_color_direct.tiff"
-    shutil.copy(str(warped), str(final_out))
-    print(f"✅ Color result: {final_out}")
-
+    shutil.copy(str(warped_rgb_path), str(final_out))
+    print(f"✅ Color result copied from {warped_rgb_path.name} → {final_out.name}")
     results.update(success=True, registered_path=str(final_out), elapsed_time=elapsed)
     return results
 
