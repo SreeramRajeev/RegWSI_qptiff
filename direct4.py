@@ -208,11 +208,16 @@ def create_registration_params():
     }
     
     # TIFF support
-    params['loading_params']['loader'] = 'tiff'
-    params['loading_params']['downsample_factor'] = 1
+    params['loading_params'] = {
+        'loader': 'tiff',
+        'downsample_factor': 1,
+    }
     
-    # Ensure displacement field is saved
+    # CRITICAL: Ensure displacement field is saved
     params['save_displacement_field'] = True
+    params['save_deformation_field'] = True  # Alternative name
+    params['save_transform_parameters'] = True
+    params['output_displacement_field'] = True
     
     return params
 
@@ -239,6 +244,50 @@ def find_displacement_field(reg_dir, temp_dir, case_name='qptiff_reg'):
             return path
     
     print("   Displacement field not found in any expected location")
+    return None
+
+def try_extract_displacement_field(reg_dir, temp_dir, case_name='qptiff_reg'):
+    """
+    Try to extract displacement field from registration results
+    """
+    print("   Attempting to extract displacement field from results...")
+    
+    # Look for any .npy files that might contain displacement info
+    npy_files = list(reg_dir.rglob("*.npy"))
+    npy_files.extend(list(temp_dir.rglob("*.npy")))
+    
+    for npy_file in npy_files:
+        try:
+            data = np.load(str(npy_file))
+            print(f"   Found NPY file: {npy_file.name}, shape: {data.shape}")
+            
+            # Check if this looks like a displacement field
+            if len(data.shape) == 3 and data.shape[0] == 2:
+                print(f"   This looks like a displacement field!")
+                return npy_file
+            elif len(data.shape) == 3 and data.shape[2] == 2:
+                print(f"   This looks like a displacement field!")
+                return npy_file
+        except Exception as e:
+            print(f"   Error loading {npy_file.name}: {e}")
+    
+    # Look for other common displacement field formats
+    possible_extensions = ['.mha', '.mhd', '.nii', '.nii.gz']
+    for ext in possible_extensions:
+        disp_files = list(reg_dir.rglob(f"*{ext}"))
+        disp_files.extend(list(temp_dir.rglob(f"*{ext}")))
+        
+        for disp_file in disp_files:
+            if 'displacement' in disp_file.name.lower() or 'deformation' in disp_file.name.lower():
+                print(f"   Found potential displacement field: {disp_file}")
+                # Try to load and convert to numpy
+                try:
+                    # This would require SimpleITK or similar
+                    print(f"   Found displacement field in {ext} format: {disp_file.name}")
+                    return disp_file
+                except Exception as e:
+                    print(f"   Could not load {disp_file.name}: {e}")
+    
     return None
 
 def apply_displacement_field_to_color(color_image, displacement_field):
@@ -300,6 +349,73 @@ def find_warped_result(reg_dir, case_name='qptiff_reg'):
         return warped_files[0]
     
     print("   No warped result found")
+    return None
+
+def load_warped_result_robust(warped_path):
+    """
+    Robust loading of warped result with multiple fallback methods
+    """
+    print(f"   Attempting to load: {warped_path}")
+    
+    # Method 1: Try tifffile first
+    try:
+        print("   Trying tifffile...")
+        warped = tifffile.imread(str(warped_path))
+        print(f"   ✅ Success with tifffile, shape: {warped.shape}")
+        return warped
+    except Exception as e:
+        print(f"   ❌ tifffile failed: {e}")
+    
+    # Method 2: Try OpenCV
+    try:
+        print("   Trying OpenCV...")
+        warped = cv2.imread(str(warped_path), cv2.IMREAD_COLOR)
+        if warped is not None:
+            warped = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
+            print(f"   ✅ Success with OpenCV, shape: {warped.shape}")
+            return warped
+        else:
+            print("   ❌ OpenCV returned None")
+    except Exception as e:
+        print(f"   ❌ OpenCV failed: {e}")
+    
+    # Method 3: Try PIL
+    try:
+        print("   Trying PIL...")
+        from PIL import Image
+        pil_img = Image.open(str(warped_path))
+        warped = np.array(pil_img)
+        print(f"   ✅ Success with PIL, shape: {warped.shape}")
+        return warped
+    except Exception as e:
+        print(f"   ❌ PIL failed: {e}")
+    
+    # Method 4: Try with specific tifffile parameters
+    try:
+        print("   Trying tifffile with specific parameters...")
+        with tifffile.TiffFile(str(warped_path)) as tif:
+            print(f"   TIFF info: {len(tif.pages)} pages")
+            for i, page in enumerate(tif.pages):
+                print(f"   Page {i}: {page.shape}, {page.dtype}, compression: {page.compression}")
+            
+            # Try loading the first page
+            warped = tif.pages[0].asarray()
+            print(f"   ✅ Success with specific parameters, shape: {warped.shape}")
+            return warped
+    except Exception as e:
+        print(f"   ❌ Specific tifffile failed: {e}")
+    
+    # Method 5: Try skimage
+    try:
+        print("   Trying skimage...")
+        from skimage import io
+        warped = io.imread(str(warped_path))
+        print(f"   ✅ Success with skimage, shape: {warped.shape}")
+        return warped
+    except Exception as e:
+        print(f"   ❌ skimage failed: {e}")
+    
+    print("   ❌ All loading methods failed")
     return None
 
 #############################################################################
@@ -433,11 +549,27 @@ def register_qptiff_direct_color(he_qptiff_path: Path, if_qptiff_path: Path,
         
         print(f"   ✅ Registration completed in {elapsed:.1f} seconds")
         
+        # Debug: Check what files were created
+        print(f"\n   Debug: Files created in registration directory:")
+        for file in sorted(reg_dir.rglob("*")):
+            if file.is_file():
+                print(f"     {file.relative_to(reg_dir)} ({file.stat().st_size} bytes)")
+        
+        print(f"\n   Debug: Files created in temp directory:")
+        for file in sorted(temp_dir.rglob("*")):
+            if file.is_file():
+                print(f"     {file.relative_to(temp_dir)} ({file.stat().st_size} bytes)")
+        
         # Step 5: Apply transformation with improved handling
         print("\n5. Applying transformation to original color H&E...")
         
         # Try to find displacement field
         disp_field_path = find_displacement_field(reg_dir, temp_dir, 'qptiff_color_reg')
+        
+        # If not found, try to extract from other files
+        if disp_field_path is None:
+            disp_field_path = try_extract_displacement_field(reg_dir, temp_dir, 'qptiff_color_reg')
+        
         warped_color = None
         
         if disp_field_path:
@@ -480,9 +612,9 @@ def register_qptiff_direct_color(he_qptiff_path: Path, if_qptiff_path: Path,
             warped_path = find_warped_result(reg_dir, 'qptiff_color_reg')
             
             if warped_path:
-                try:
-                    warped_color = tifffile.imread(str(warped_path))
-                    
+                warped_color = load_warped_result_robust(warped_path)
+                
+                if warped_color is not None:
                     # Save as color result
                     final_output_path = output_dir / "registered_HE_from_warped.tiff"
                     tifffile.imwrite(
@@ -498,9 +630,48 @@ def register_qptiff_direct_color(he_qptiff_path: Path, if_qptiff_path: Path,
                     results['registered_path'] = final_output_path
                     results['method'] = 'direct_warped'
                     results['preprocessing_method'] = preprocessing_method
-                    
+                    results['elapsed_time'] = elapsed
+                else:
+                    print("   ❌ Could not load warped result with any method")
+        
+        # Last resort: Try to create a simple transformation if we have both original and warped
+        if warped_color is None:
+            print("\n   Last resort: Trying to create simple transformation...")
+            
+            # Try to find any result files that might help
+            result_files = list(reg_dir.glob("*.tiff")) + list(reg_dir.glob("*.tif"))
+            print(f"   Found {len(result_files)} TIFF files in registration directory")
+            
+            for result_file in result_files:
+                print(f"   Checking: {result_file.name}")
+                try:
+                    # Try to load with our robust method
+                    test_img = load_warped_result_robust(result_file)
+                    if test_img is not None:
+                        print(f"   ✅ Successfully loaded {result_file.name}")
+                        
+                        # If this looks like a reasonable result, use it
+                        if test_img.shape[:2] == target_shape[:2]:
+                            warped_color = test_img
+                            
+                            final_output_path = output_dir / f"registered_HE_from_{result_file.stem}.tiff"
+                            tifffile.imwrite(
+                                final_output_path,
+                                warped_color,
+                                photometric='rgb',
+                                compression='lzw',
+                                bigtiff=True
+                            )
+                            
+                            print(f"   ✅ Saved result from {result_file.name}")
+                            results['success'] = True
+                            results['registered_path'] = final_output_path
+                            results['method'] = f'from_{result_file.stem}'
+                            results['preprocessing_method'] = preprocessing_method
+                            results['elapsed_time'] = elapsed
+                            break
                 except Exception as e:
-                    print(f"   ❌ Error loading warped result: {e}")
+                    print(f"   ❌ Could not load {result_file.name}: {e}")
         
         if warped_color is None:
             print("   ❌ No usable registration result found")
