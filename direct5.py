@@ -19,6 +19,11 @@ from typing import Union
 import numpy as np
 import torch as tc
 import matplotlib.pyplot as plt
+import os
+
+# GPU Optimization for H200
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use first GPU
+tc.cuda.empty_cache()  # Clear GPU cache
 
 ### DeeperHistReg Imports ###
 import deeperhistreg
@@ -26,7 +31,30 @@ from deeperhistreg.dhr_input_output.dhr_loaders import tiff_loader
 from deeperhistreg.dhr_pipeline.registration_params import default_initial_nonrigid
 
 
-def parse_arguments():
+def setup_gpu_environment():
+    """Setup GPU environment for H200."""
+    print("Setting up GPU environment...")
+    
+    # Check CUDA availability
+    if tc.cuda.is_available():
+        gpu_name = tc.cuda.get_device_name(0)
+        gpu_memory = tc.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"GPU: {gpu_name}")
+        print(f"GPU Memory: {gpu_memory:.1f} GB")
+        print(f"CUDA Version: {tc.version.cuda}")
+        print(f"PyTorch Version: {tc.__version__}")
+        
+        # Set GPU memory fraction to avoid OOM
+        tc.cuda.set_per_process_memory_fraction(0.9)
+        
+        # Enable optimizations
+        tc.backends.cudnn.benchmark = True
+        tc.backends.cudnn.deterministic = False
+        
+        return True
+    else:
+        print("Warning: CUDA not available, using CPU")
+        return False
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Register two WSI qptiff images using DeeperHistReg",
@@ -106,6 +134,27 @@ def parse_arguments():
         help="Y offset for patch extraction"
     )
     
+    parser.add_argument(
+        "--gpu-memory-fraction", 
+        default=0.9, 
+        type=float,
+        help="Fraction of GPU memory to use (0.1-1.0)"
+    )
+    
+    parser.add_argument(
+        "--batch-size", 
+        default=None, 
+        type=int,
+        help="Batch size for processing (auto-determined if not set)"
+    )
+    
+    parser.add_argument(
+        "--num-workers", 
+        default=4, 
+        type=int,
+        help="Number of data loading workers"
+    )
+    
     return parser.parse_args()
 
 
@@ -129,8 +178,8 @@ def validate_inputs(args):
     return he_path, if_path
 
 
-def load_and_visualize_images(he_path, if_path, args, output_dir):
-    """Load images and create visualization plots."""
+def load_and_analyze_images(he_path, if_path, args, output_dir):
+    """Load images and perform analysis without visualization."""
     print("Loading images...")
     
     # Load images
@@ -143,12 +192,33 @@ def load_and_visualize_images(he_path, if_path, args, output_dir):
     print(f"H&E image shape: {he_image.shape}")
     print(f"IF image shape: {if_image.shape}")
     
+    # Calculate image statistics
+    he_stats = {
+        'mean': np.mean(he_image),
+        'std': np.std(he_image),
+        'min': np.min(he_image),
+        'max': np.max(he_image)
+    }
+    
+    if_stats = {
+        'mean': np.mean(if_image),
+        'std': np.std(if_image),
+        'min': np.min(if_image),
+        'max': np.max(if_image)
+    }
+    
+    print(f"H&E stats - Mean: {he_stats['mean']:.2f}, Std: {he_stats['std']:.2f}, Range: [{he_stats['min']}-{he_stats['max']}]")
+    print(f"IF stats - Mean: {if_stats['mean']:.2f}, Std: {if_stats['std']:.2f}, Range: [{if_stats['min']}-{if_stats['max']}]")
+    
     if args.visualize:
         print("Creating pre-registration visualizations...")
         
         # Create output directory for visualizations
         viz_dir = output_dir / "visualizations"
         viz_dir.mkdir(exist_ok=True)
+        
+        # Use Agg backend for headless operation
+        plt.switch_backend('Agg')
         
         # Full images
         plt.figure(figsize=(15, 10), dpi=150)
@@ -185,6 +255,9 @@ def load_and_visualize_images(he_path, if_path, args, output_dir):
             plt.title(f"IF Patch ({args.patch_size}x{args.patch_size})")
             plt.axis('off')
             
+            print(f"H&E patch shape: {he_patch.shape}")
+            print(f"IF patch shape: {if_patch.shape}")
+            
         except Exception as e:
             print(f"Warning: Could not extract patches: {e}")
         
@@ -204,6 +277,26 @@ def run_registration(he_path, if_path, output_dir, args):
     # Define registration parameters
     registration_params = default_initial_nonrigid()
     registration_params['loading_params']['loader'] = 'tiff'  # For qptiff/tiff formats
+    
+    # GPU-specific optimizations for H200
+    if tc.cuda.is_available():
+        registration_params['device'] = 'cuda'
+        registration_params['mixed_precision'] = True  # Enable mixed precision for H200
+        
+        # Adjust batch size based on GPU memory
+        if args.batch_size is not None:
+            registration_params['batch_size'] = args.batch_size
+        else:
+            # Auto-determine batch size based on available memory
+            gpu_memory_gb = tc.cuda.get_device_properties(0).total_memory / 1024**3
+            if gpu_memory_gb >= 80:  # H200 has ~80GB
+                registration_params['batch_size'] = 8
+            else:
+                registration_params['batch_size'] = 4
+                
+        registration_params['num_workers'] = args.num_workers
+        
+        print(f"Using GPU with batch size: {registration_params.get('batch_size', 'auto')}")
     
     # Create case name
     case_name = f"{he_path.stem}_{if_path.stem}"
@@ -230,13 +323,23 @@ def run_registration(he_path, if_path, output_dir, args):
     print(f"Output: {output_dir}")
     print(f"Case name: {case_name}")
     
-    # Run registration
+    # Run registration with GPU monitoring
     try:
+        if tc.cuda.is_available():
+            print(f"Initial GPU memory: {tc.cuda.memory_allocated()/1024**3:.2f} GB")
+        
         deeperhistreg.run_registration(**config)
+        
+        if tc.cuda.is_available():
+            print(f"Final GPU memory: {tc.cuda.memory_allocated()/1024**3:.2f} GB")
+            tc.cuda.empty_cache()  # Clean up GPU memory
+            
         print("Registration completed successfully!")
         return True
     except Exception as e:
         print(f"Registration failed: {e}")
+        if tc.cuda.is_available():
+            tc.cuda.empty_cache()  # Clean up GPU memory even on failure
         return False
 
 
@@ -267,9 +370,33 @@ def visualize_results(he_path, if_path, output_dir, args):
         registered_image = registered_loader.load_level(level=0)
         target_image = target_loader.load_level(level=0)
         
+        print(f"Registered image shape: {registered_image.shape}")
+        print(f"Target image shape: {target_image.shape}")
+        
+        # Calculate registration quality metrics
+        reg_stats = {
+            'mean': np.mean(registered_image),
+            'std': np.std(registered_image),
+            'min': np.min(registered_image),
+            'max': np.max(registered_image)
+        }
+        
+        target_stats = {
+            'mean': np.mean(target_image),
+            'std': np.std(target_image),
+            'min': np.min(target_image),
+            'max': np.max(target_image)
+        }
+        
+        print(f"Registered stats - Mean: {reg_stats['mean']:.2f}, Std: {reg_stats['std']:.2f}, Range: [{reg_stats['min']}-{reg_stats['max']}]")
+        print(f"Target stats - Mean: {target_stats['mean']:.2f}, Std: {target_stats['std']:.2f}, Range: [{target_stats['min']}-{target_stats['max']}]")
+        
         # Create visualization
         viz_dir = output_dir / "visualizations"
         viz_dir.mkdir(exist_ok=True)
+        
+        # Use Agg backend for headless operation
+        plt.switch_backend('Agg')
         
         plt.figure(figsize=(15, 10), dpi=150)
         
@@ -306,6 +433,9 @@ def visualize_results(he_path, if_path, output_dir, args):
             plt.title(f"Target IF Patch ({args.patch_size}x{args.patch_size})")
             plt.axis('off')
             
+            print(f"Registered patch shape: {registered_patch.shape}")
+            print(f"Target patch shape: {target_patch.shape}")
+            
         except Exception as e:
             print(f"Warning: Could not extract post-registration patches: {e}")
         
@@ -324,6 +454,13 @@ def main():
     args = parse_arguments()
     
     try:
+        # Setup GPU environment
+        gpu_available = setup_gpu_environment()
+        
+        if gpu_available:
+            tc.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction)
+            print(f"Set GPU memory fraction to: {args.gpu_memory_fraction}")
+        
         # Validate inputs
         he_path, if_path = validate_inputs(args)
         
@@ -331,15 +468,15 @@ def main():
         output_dir = pathlib.Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        print(f"WSI Registration Pipeline")
-        print(f"========================")
+        print(f"\nWSI Registration Pipeline (H200 Optimized)")
+        print(f"==========================================")
         print(f"H&E Image: {he_path}")
         print(f"IF Image: {if_path}")
         print(f"Output Directory: {output_dir}")
         print()
         
-        # Load and visualize images (if requested)
-        he_loader, if_loader = load_and_visualize_images(he_path, if_path, args, output_dir)
+        # Load and analyze images (headless mode)
+        he_loader, if_loader = load_and_analyze_images(he_path, if_path, args, output_dir)
         
         # Run registration
         success = run_registration(he_path, if_path, output_dir, args)
@@ -360,8 +497,15 @@ def main():
             print("\nRegistration pipeline failed!")
             sys.exit(1)
             
+        # Final GPU cleanup
+        if gpu_available:
+            tc.cuda.empty_cache()
+            print(f"Final GPU memory usage: {tc.cuda.memory_allocated()/1024**3:.2f} GB")
+            
     except Exception as e:
         print(f"Error: {e}")
+        if tc.cuda.is_available():
+            tc.cuda.empty_cache()
         sys.exit(1)
 
 
