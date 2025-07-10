@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
 Direct QPTIFF Registration Pipeline (RGB inputs)
-===============================================
-Feeds 3-channel images into DeepHistReg so output remains in color.
-Optimized for vast.ai with NVIDIA H200 GPU.
+Feeds 3‑channel RGB into DeepHistReg so the warped output stays in color.
 """
 
-import os
-import sys
-import time
-import shutil
+import os, sys, time, shutil
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional
@@ -18,31 +13,24 @@ import numpy as np
 import torch as tc
 import cv2
 import tifffile
-import matplotlib
-matplotlib.use('Agg')
-
 import deeperhistreg
 from deeperhistreg.dhr_pipeline.registration_params import default_initial_nonrigid
 
 # GPU settings
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-# Default IF channels to extract
 DEFAULT_IF_CHANNELS = [0, 1, 5]  # DAPI, CD8, CD163
 
-def preprocess_for_registration(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def preprocess_for_registration(src: np.ndarray, tgt: np.ndarray):
     """
-    RGB-preserving preprocessing:
-      - resize
-      - CLAHE per channel
-      - grayscale edge detection + blend
+    Preserve RGB: CLAHE per-channel + blend in edges.
     """
-    # 1) Resize
-    if source.shape[:2] != target.shape[:2]:
-        source = cv2.resize(source, (target.shape[1], target.shape[0]), interpolation=cv2.INTER_LINEAR)
+    # Resize src→tgt
+    if src.shape[:2] != tgt.shape[:2]:
+        src = cv2.resize(src, (tgt.shape[1], tgt.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-    # 2) CLAHE separately on each channel
+    # CLAHE on each channel
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16,16))
-    def apply_clahe_rgb(img):
+    def clahe_rgb(img):
         out = np.zeros_like(img)
         for c in range(3):
             ch = img[..., c]
@@ -51,57 +39,115 @@ def preprocess_for_registration(source: np.ndarray, target: np.ndarray) -> tuple
             out[..., c] = clahe.apply(ch)
         return out
 
-    src_clahe = apply_clahe_rgb(source)
-    tgt_clahe = apply_clahe_rgb(target)
+    src_c = clahe_rgb(src)
+    tgt_c = clahe_rgb(tgt)
 
-    # 3) Edge detection on grayscale, then stack to 3 channels
-    src_gray = cv2.cvtColor(source, cv2.COLOR_RGB2GRAY)
-    tgt_gray = cv2.cvtColor(target, cv2.COLOR_RGB2GRAY)
-    src_edges = cv2.Canny(src_gray, 30, 100)
-    tgt_edges = cv2.Canny(tgt_gray, 30, 100)
-    src_edges_rgb = cv2.cvtColor(src_edges, cv2.COLOR_GRAY2RGB)
-    tgt_edges_rgb = cv2.cvtColor(tgt_edges, cv2.COLOR_GRAY2RGB)
+    # Edges from grayscale
+    src_g = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY)
+    tgt_g = cv2.cvtColor(tgt, cv2.COLOR_RGB2GRAY)
+    src_e = cv2.Canny(src_g, 30, 100)
+    tgt_e = cv2.Canny(tgt_g, 30, 100)
+    src_e3 = cv2.cvtColor(src_e, cv2.COLOR_GRAY2RGB)
+    tgt_e3 = cv2.cvtColor(tgt_e, cv2.COLOR_GRAY2RGB)
 
-    # 4) Blend CLAHE + edges
-    src_final = cv2.addWeighted(src_clahe, 0.7, src_edges_rgb, 0.3, 0)
-    tgt_final = cv2.addWeighted(tgt_clahe, 0.7, tgt_edges_rgb, 0.3, 0)
-
+    # Blend
+    src_final = cv2.addWeighted(src_c, 0.7, src_e3, 0.3, 0)
+    tgt_final = cv2.addWeighted(tgt_c, 0.7, tgt_e3, 0.3, 0)
     return src_final, tgt_final
 
 def create_registration_params() -> Dict:
     params = default_initial_nonrigid()
-    # (keep your existing superpoint/superglue & nonrigid settings…)
-    # [snip: identical to your original create_registration_params]
+    # ---- your original feature + nonrigid + multires + optimization params here ----
+    # For brevity, paste exactly your working dict setup from before:
+    params['initial_alignment_params'] = {
+        'type': 'feature_based', 'detector': 'superpoint', 'matcher': 'superglue',
+        'ransac_threshold': 10.0, 'max_features': 10000, 'match_ratio': 0.9,
+        'use_mutual_best': False, 'nms_radius': 4, 'keypoint_threshold': 0.005,
+        'max_keypoints': -1, 'remove_borders': 4,
+    }
+    params['nonrigid_params'] = {
+        'type': 'demons', 'iterations': [200,150,100,50],
+        'smoothing_sigma': 3.0, 'update_field_sigma': 2.0,
+        'max_step_length': 5.0, 'use_histogram_matching': True,
+        'use_symmetric_forces': True, 'use_gradient_type': 'symmetric',
+    }
+    params['multiresolution_params'] = {
+        'levels': 5,
+        'shrink_factors': [16,8,4,2,1],
+        'smoothing_sigmas': [8.0,4.0,2.0,1.0,0.5],
+    }
+    params['optimization_params'] = {
+        'metric': 'mattes_mutual_information',
+        'number_of_bins': 32,
+        'optimizer': 'gradient_descent',
+        'learning_rate': 2.0,
+        'min_step': 0.001,
+        'iterations': 500,
+        'relaxation_factor': 0.8,
+        'gradient_magnitude_tolerance': 1e-6,
+        'metric_sampling_strategy': 'random',
+        'metric_sampling_percentage': 0.1,
+    }
     params['loading_params']['loader'] = 'tiff'
     params['loading_params']['downsample_factor'] = 1
     params['save_displacement_field'] = True
     return params
 
-def register_qptiff_direct(he_qptiff_path: Path, if_qptiff_path: Path,
-                          output_dir: Path, if_channels: Optional[list[int]] = None) -> Dict:
+def register_qptiff_direct(
+    he_qptiff_path: Path,
+    if_qptiff_path: Path,
+    output_dir: Path,
+    if_channels: Optional[list[int]] = None
+) -> Dict:
     if if_channels is None:
         if_channels = DEFAULT_IF_CHANNELS
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    reg_dir = output_dir / "registration"; reg_dir.mkdir(exist_ok=True)
-    temp_dir = reg_dir / "TEMP";   temp_dir.mkdir(exist_ok=True)
+    reg_dir  = output_dir/"registration"; reg_dir.mkdir(exist_ok=True)
+    temp_dir = reg_dir/"TEMP";    temp_dir.mkdir(exist_ok=True)
     results: Dict = {}
 
-    # --- Step 1: prepare IF RGB ---
+    # --- Step 1: load & extract IF→RGB ---
     with tifffile.TiffFile(if_qptiff_path) as tif:
         if_data = tif.asarray()
-        # handle 4D→3D logic (your original code)...
-        # extract channels, normalize to UINT8, stack first 3 → if_rgb
-        # save if_rgb to temp_dir / "if_rgb_temp.tiff"
-    # target_shape = if_rgb.shape
+    # Handle 4D Z,C,Y,X → pick C-major
+    if if_data.ndim == 4:
+        # assume shape (Z,C,Y,X) or (C,Z,Y,X)
+        if if_data.shape[0] < if_data.shape[1]:
+            if_data = if_data[0]
+        else:
+            if_data = if_data[:,0]
+    # Now if_data is C×Y×X or Y×X
+    if if_data.ndim == 3 and if_data.shape[0] >= max(if_channels)+1:
+        chans = []
+        for ch in if_channels[:3]:
+            plane = if_data[ch]
+            p1, p99 = np.percentile(plane, [1,99])
+            norm = np.clip((plane - p1)/(p99-p1)*255,0,255).astype(np.uint8)
+            chans.append(norm)
+        if_rgb = np.stack(chans, axis=-1)
+    else:
+        # fallback: interpret as Y×X×C
+        if_rgb = if_data if if_data.ndim==3 else cv2.cvtColor(if_data, cv2.COLOR_GRAY2RGB)
+    tifffile.imwrite(temp_dir/"if_rgb_temp.tiff", if_rgb, photometric='rgb', compression='lzw')
+    target_shape = if_rgb.shape
 
-    # --- Step 2: prepare H&E RGB ---
+    # --- Step 2: load H&E original & preprocess RGB ---
     with tifffile.TiffFile(he_qptiff_path) as tif:
-        he_data = tif.pages[0].asarray()
-        # transpose if needed, cast to RGB, uint8, resize to target_shape
-        # save he_temp to temp_dir
+        he_page = tif.pages[0]
+        he_data = he_page.asarray()
+    # H×W×C or C×H×W
+    if he_data.ndim==3 and he_data.shape[0]==3:
+        he_data = np.transpose(he_data, (1,2,0))
+    if he_data.ndim==2:
+        he_data = cv2.cvtColor(he_data, cv2.COLOR_GRAY2RGB)
+    if he_data.dtype!=np.uint8:
+        he_data = (he_data/np.max(he_data)*255).astype(np.uint8)
+    if he_data.shape[:2] != target_shape[:2]:
+        he_data = cv2.resize(he_data, (target_shape[1],target_shape[0]), interpolation=cv2.INTER_LINEAR)
+    tifffile.imwrite(temp_dir/"he_rgb_temp.tiff", he_data, photometric='rgb', compression='lzw')
 
-    # --- Step 3: preprocess both in RGB ---
+    # --- Step 3: RGB preprocessing for registration ---
     he_prep, if_prep = preprocess_for_registration(he_data, if_rgb)
     tifffile.imwrite(reg_dir/"he_preprocessed.tiff", he_prep, photometric='rgb', compression='lzw')
     tifffile.imwrite(reg_dir/"if_preprocessed.tiff", if_prep, photometric='rgb', compression='lzw')
@@ -122,43 +168,48 @@ def register_qptiff_direct(he_qptiff_path: Path, if_qptiff_path: Path,
     start = time.time()
     deeperhistreg.run_registration(**config)
     elapsed = time.time() - start
-    print(f"   Registration done in {elapsed:.1f}s")
+    print(f"   ✔ DeepHistReg took {elapsed:.1f}s")
 
-    # --- Step 5: locate the RGB warped output directly ---
-    warped_rgb_path = reg_dir / "qptiff_rgb_warped_source.tiff"
-    if warped_rgb_path.exists():
-        # This is already 3-channel color
-        final = output_dir/"registered_HE_color_direct.tiff"
-        shutil.copy(warped_rgb_path, final)
-        print(f"✅ Color-warped TIFF available: {final}")
-        results.update(success=True, registered_path=final, elapsed_time=elapsed)
-    else:
-        raise FileNotFoundError("Expected 3-channel warped_source.tiff not found in registration folder")
+    # --- Step 5: grab the 3‑channel warped_source directly ---
+    warped = reg_dir/"qptiff_rgb_warped_source.tiff"
+    if not warped.exists():
+        warped = reg_dir/"qptiff_rgb/qptiff_rgb_warped_source.tiff"
+    if not warped.exists():
+        raise FileNotFoundError(f"No 3‑channel warped_source found in {reg_dir}")
 
+    final_out = output_dir/"registered_HE_color_direct.tiff"
+    shutil.copy(str(warped), str(final_out))
+    print(f"✅ Color result: {final_out}")
+
+    results.update(success=True, registered_path=str(final_out), elapsed_time=elapsed)
     return results
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--he-qptiff",  required=True)
-    parser.add_argument("--if-qptiff",  required=True)
-    parser.add_argument("--output-dir", default="./output")
-    parser.add_argument("--if-channels", type=int, nargs='+', default=[0,1,5])
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--he-qptiff", required=True)
+    p.add_argument("--if-qptiff", required=True)
+    p.add_argument("--output-dir", default="./output")
+    p.add_argument("--if-channels", type=int, nargs="+", default=[0,1,5])
+    args = p.parse_args()
 
-    he_path = Path(args.he_qptiff)
-    if_path = Path(args.if_qptiff)
-    out_dir = Path(args.output_dir)
-
-    print(f"✅ GPU: {tc.cuda.get_device_name(0) if tc.cuda.is_available() else 'None'}")
-    results = register_qptiff_direct(he_path, if_path, out_dir, args.if_channels)
-    if results.get('success'):
+    print(f"\nStarted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"GPU: {tc.cuda.get_device_name(0) if tc.cuda.is_available() else 'None'}")
+    out = register_qptiff_direct(
+        Path(args.he_qptiff),
+        Path(args.if_qptiff),
+        Path(args.output_dir),
+        args.if_channels
+    )
+    if out.get("success"):
         print("\n🎉 Registration complete!")
-        print(f"   Output: {results['registered_path']}")
-        print(f"   Time:   {results['elapsed_time']:.1f}s")
+        print(f" Output: {out['registered_path']}")
+        print(f" Time:   {out['elapsed_time']:.1f}s")
+        sys.exit(0)
     else:
         print("❌ Registration failed.")
+        sys.exit(1)
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__=="__main__":
+    main()
 
