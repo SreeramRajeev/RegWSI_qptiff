@@ -32,73 +32,43 @@ from deeperhistreg.dhr_pipeline.registration_params import default_initial_nonri
 
 
 def parse_arguments():
-    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Register two WSI qptiff images using DeeperHistReg",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    parser.add_argument(
-        "--he-qptiff", required=True, type=str,
-        help="Path to the H&E stained WSI qptiff file (source image)"
-    )
-    parser.add_argument(
-        "--if-qptiff", required=True, type=str,
-        help="Path to the IF stained WSI qptiff file (target image)"
-    )
-    parser.add_argument(
-        "--output-dir", required=True, type=str,
-        help="Output directory for registration results"
-    )
-    parser.add_argument(
-        "--registration-level", default=0, type=int,
-        help="Pyramid level for registration (0 = highest resolution)"
-    )
-    parser.add_argument(
-        "--save-displacement-field", action="store_true",
-        help="Save the displacement field for further analysis"
-    )
-    parser.add_argument(
-        "--copy-target", action="store_true",
-        help="Copy the target image to output directory"
-    )
-    parser.add_argument(
-        "--keep-temp", action="store_true",
-        help="Keep temporary files after registration"
-    )
-    parser.add_argument(
-        "--visualize", action="store_true",
-        help="Generate visualization plots before and after registration"
-    )
-    parser.add_argument(
-        "--patch-size", default=1024, type=int,
-        help="Size of patches for visualization"
-    )
-    parser.add_argument(
-        "--patch-offset-x", default=1000, type=int,
-        help="X offset for patch extraction"
-    )
-    parser.add_argument(
-        "--patch-offset-y", default=1000, type=int,
-        help="Y offset for patch extraction"
-    )
-    parser.add_argument(
-        "--gpu-memory-fraction", default=0.9, type=float,
-        help="Fraction of GPU memory to use (0.1-1.0)"
-    )
-    parser.add_argument(
-        "--batch-size", default=None, type=int,
-        help="Batch size for processing (auto-determined if not set)"
-    )
-    parser.add_argument(
-        "--num-workers", default=4, type=int,
-        help="Number of data loading workers"
-    )
+    parser.add_argument("--he-qptiff", required=True, type=str,
+                        help="Path to the H&E stained WSI qptiff file (source image)")
+    parser.add_argument("--if-qptiff", required=True, type=str,
+                        help="Path to the IF stained WSI qptiff file (target image)")
+    parser.add_argument("--output-dir", required=True, type=str,
+                        help="Output directory for registration results")
+    parser.add_argument("--registration-level", default=0, type=int,
+                        help="Pyramid level for registration (0 = highest resolution)")
+    parser.add_argument("--save-displacement-field", action="store_true",
+                        help="Save the displacement field for further analysis")
+    parser.add_argument("--copy-target", action="store_true",
+                        help="Copy the target image to output directory")
+    parser.add_argument("--keep-temp", action="store_true",
+                        help="Keep temporary files after registration")
+    parser.add_argument("--visualize", action="store_true",
+                        help="Generate visualization plots before and after registration")
+    parser.add_argument("--patch-size", default=1024, type=int,
+                        help="Size of patches for visualization")
+    parser.add_argument("--patch-offset-x", default=1000, type=int,
+                        help="X offset for patch extraction")
+    parser.add_argument("--patch-offset-y", default=1000, type=int,
+                        help="Y offset for patch extraction")
+    parser.add_argument("--gpu-memory-fraction", default=0.9, type=float,
+                        help="Fraction of GPU memory to use (0.1-1.0)")
+    parser.add_argument("--batch-size", default=None, type=int,
+                        help="Batch size for processing (auto-determined if not set)")
+    parser.add_argument("--num-workers", default=4, type=int,
+                        help="Number of data loading workers")
     return parser.parse_args()
 
 
 def setup_gpu_environment():
-    """Setup GPU environment for H200."""
     print("Setting up GPU environment...")
     if tc.cuda.is_available():
         gpu_name = tc.cuda.get_device_name(0)
@@ -117,22 +87,20 @@ def setup_gpu_environment():
 
 
 def validate_inputs(args):
-    """Validate input arguments."""
     he_path = pathlib.Path(args.he_qptiff)
     if_path = pathlib.Path(args.if_qptiff)
     if not he_path.exists():
         raise FileNotFoundError(f"H&E qptiff file not found: {he_path}")
     if not if_path.exists():
         raise FileNotFoundError(f"IF qptiff file not found: {if_path}")
-    if not he_path.suffix.lower() in ['.qptiff', '.tiff', '.tif']:
+    if he_path.suffix.lower() not in ['.qptiff', '.tiff', '.tif']:
         raise ValueError(f"H&E file must be a qptiff/tiff file: {he_path}")
-    if not if_path.suffix.lower() in ['.qptiff', '.tiff', '.tif']:
+    if if_path.suffix.lower() not in ['.qptiff', '.tiff', '.tif']:
         raise ValueError(f"IF file must be a qptiff/tiff file: {if_path}")
     return he_path, if_path
 
 
 def load_and_analyze_images(he_path, if_path, args, output_dir):
-    """Load images and perform analysis without visualization."""
     print("Loading images...")
     he_loader = tiff_loader.TIFFLoader(he_path)
     if_loader = tiff_loader.TIFFLoader(if_path)
@@ -140,14 +108,10 @@ def load_and_analyze_images(he_path, if_path, args, output_dir):
     if_image = if_loader.load_level(level=args.registration_level)
     print(f"H&E image shape: {he_image.shape}")
     print(f"IF image shape: {if_image.shape}")
-    he_stats = {
-        'mean': np.mean(he_image), 'std': np.std(he_image),
-        'min': np.min(he_image), 'max': np.max(he_image)
-    }
-    if_stats = {
-        'mean': np.mean(if_image), 'std': np.std(if_image),
-        'min': np.min(if_image), 'max': np.max(if_image)
-    }
+    he_stats = {'mean': np.mean(he_image), 'std': np.std(he_image),
+                'min': np.min(he_image), 'max': np.max(he_image)}
+    if_stats = {'mean': np.mean(if_image), 'std': np.std(if_image),
+                'min': np.min(if_image), 'max': np.max(if_image)}
     print(f"H&E stats - Mean: {he_stats['mean']:.2f}, Std: {he_stats['std']:.2f}, Range: [{he_stats['min']}-{he_stats['max']}]" )
     print(f"IF stats - Mean: {if_stats['mean']:.2f}, Std: {if_stats['std']:.2f}, Range: [{if_stats['min']}-{if_stats['max']}]" )
     if args.visualize:
@@ -158,16 +122,12 @@ def load_and_analyze_images(he_path, if_path, args, output_dir):
         plt.subplot(2, 2, 1); plt.imshow(he_image); plt.title("H&E Image (Source)"); plt.axis('off')
         plt.subplot(2, 2, 2); plt.imshow(if_image); plt.title("IF Image (Target)"); plt.axis('off')
         try:
-            he_patch = he_loader.load_region(
-                level=args.registration_level,
-                offset=(args.patch_offset_x, args.patch_offset_y),
-                shape=(args.patch_size, args.patch_size)
-            )
-            if_patch = if_loader.load_region(
-                level=args.registration_level,
-                offset=(args.patch_offset_x, args.patch_offset_y),
-                shape=(args.patch_size, args.patch_size)
-            )
+            he_patch = he_loader.load_region(level=args.registration_level,
+                                            offset=(args.patch_offset_x, args.patch_offset_y),
+                                            shape=(args.patch_size, args.patch_size))
+            if_patch = if_loader.load_region(level=args.registration_level,
+                                            offset=(args.patch_offset_x, args.patch_offset_y),
+                                            shape=(args.patch_size, args.patch_size))
             plt.subplot(2, 2, 3); plt.imshow(he_patch); plt.title(f"H&E Patch ({args.patch_size}x{args.patch_size})"); plt.axis('off')
             plt.subplot(2, 2, 4); plt.imshow(if_patch); plt.title(f"IF Patch ({args.patch_size}x{args.patch_size})"); plt.axis('off')
             print(f"H&E patch shape: {he_patch.shape}")
@@ -180,39 +140,27 @@ def load_and_analyze_images(he_path, if_path, args, output_dir):
 
 
 def run_registration(he_path, if_path, output_dir, args):
-    """Run the registration process."""
     print("Setting up registration configuration...")
-    registration_params = default_initial_nonrigid()
-    registration_params['loading_params']['loader'] = 'tiff'
+    params = default_initial_nonrigid()
+    params['loading_params']['loader'] = 'tiff'
     if tc.cuda.is_available():
-        registration_params['device'] = 'cuda'
-        registration_params['mixed_precision'] = True
-        if args.batch_size is not None:
-            registration_params['batch_size'] = args.batch_size
-        else:
-            gpu_memory_gb = tc.cuda.get_device_properties(0).total_memory / 1024**3
-            registration_params['batch_size'] = 8 if gpu_memory_gb >= 80 else 4
-        registration_params['num_workers'] = args.num_workers
-        print(f"Using GPU with batch size: {registration_params['batch_size']}")
+        params['device'] = 'cuda'; params['mixed_precision'] = True
+        params['batch_size'] = args.batch_size if args.batch_size else (
+            8 if tc.cuda.get_device_properties(0).total_memory/1024**3 >= 80 else 4)
+        params['num_workers'] = args.num_workers
+        print(f"Using GPU with batch size: {params['batch_size']}")
     case_name = f"{he_path.stem}_{if_path.stem}"
-    temporary_path = output_dir / f"{case_name}_TEMP"
-    config = {
-        'source_path': he_path, 'target_path': if_path,
-        'output_path': output_dir,
-        'registration_parameters': registration_params,
-        'case_name': case_name,
-        'save_displacement_field': args.save_displacement_field,
-        'copy_target': args.copy_target,
-        'delete_temporary_results': not args.keep_temp,
-        'temporary_path': temporary_path
-    }
+    temp_path = output_dir / f"{case_name}_TEMP"
+    config = {'source_path': he_path, 'target_path': if_path,
+              'output_path': output_dir, 'registration_parameters': params,
+              'case_name': case_name, 'save_displacement_field': args.save_displacement_field,
+              'copy_target': args.copy_target, 'delete_temporary_results': not args.keep_temp,
+              'temporary_path': temp_path}
     print(f"Source: {he_path}\nTarget: {if_path}\nOutput: {output_dir}\nCase name: {case_name}")
     try:
         if tc.cuda.is_available(): print(f"Initial GPU memory: {tc.cuda.memory_allocated()/1024**3:.2f} GB")
         deeperhistreg.run_registration(**config)
-        if tc.cuda.is_available():
-            print(f"Final GPU memory: {tc.cuda.memory_allocated()/1024**3:.2f} GB")
-            tc.cuda.empty_cache()
+        if tc.cuda.is_available(): tc.cuda.empty_cache(); print(f"Final GPU memory: {tc.cuda.memory_allocated()/1024**3:.2f} GB")
         print("Registration completed successfully!")
         return True
     except Exception as e:
@@ -222,26 +170,25 @@ def run_registration(he_path, if_path, output_dir, args):
 
 
 def visualize_results(he_path, if_path, output_dir, args):
-    """Create post-registration visualizations."""
     if not args.visualize: return
     print("Creating post-registration visualizations...")
-    registered_source_path = None
+    reg_path = None
     for ext in ['.tiff', '.tif']:
         p = output_dir / f"{he_path.stem}_registered{ext}"
-        if p.exists(): registered_source_path = p; break
-    if registered_source_path is None:
-        print("Warning: Could not find registered source image for visualization")
+        if p.exists(): reg_path = p; break
+    if not reg_path:
+        print("Warning: Registered image not found")
         return
     try:
-        registered_loader = tiff_loader.TIFFLoader(registered_source_path)
-        target_loader = tiff_loader.TIFFLoader(if_path)
-        reg_img = registered_loader.load_level(level=0)
-        tgt_img = target_loader.load_level(level=0)
+        reg_loader = tiff_loader.TIFFLoader(reg_path)
+        tgt_loader = tiff_loader.TIFFLoader(if_path)
+        reg_img = reg_loader.load_level(level=0)
+        tgt_img = tgt_loader.load_level(level=0)
         print(f"Registered shape: {reg_img.shape}, Target shape: {tgt_img.shape}")
         reg_stats = {'mean': np.mean(reg_img), 'std': np.std(reg_img), 'min': np.min(reg_img), 'max': np.max(reg_img)}
-        tgt_stats = {'mean': np.mean(tgt_img), 'std': np.std(tgt_img, 'min': np.min(tgt_img), 'max': np.max(tgt_img)}
-        print(f"Registered stats - Mean: {reg_stats['mean']:.2f}, Std: {reg_stats['std']:.2f}")
-        print(f"Target stats - Mean: {tgt_stats['mean']:.2f}, Std: {tgt_stats['std']:.2f}")
+        tgt_stats = {'mean': np.mean(tgt_img), 'std': np.std(tgt_img), 'min': np.min(tgt_img), 'max': np.max(tgt_img)}
+        print(f"Registered stats - Mean: {reg_stats['mean']:.2f}, Std: {reg_stats['std']:.2f}, Range: [{reg_stats['min']}-{reg_stats['max']}]" )
+        print(f"Target stats - Mean: {tgt_stats['mean']:.2f}, Std: {tgt_stats['std']:.2f}, Range: [{tgt_stats['min']}-{tgt_stats['max']}]" )
         viz_dir = output_dir / "visualizations"
         viz_dir.mkdir(exist_ok=True)
         plt.switch_backend('Agg')
@@ -249,8 +196,12 @@ def visualize_results(he_path, if_path, output_dir, args):
         plt.subplot(2, 2, 1); plt.imshow(reg_img); plt.title("Registered H&E Image"); plt.axis('off')
         plt.subplot(2, 2, 2); plt.imshow(tgt_img); plt.title("Target IF Image"); plt.axis('off')
         try:
-            reg_patch = registered_loader.load_region(level=0, offset=(args.patch_offset_x, args.patch_offset_y), shape=(args.patch_size, args.patch_size))
-            tgt_patch = target_loader.load_region(level=0, offset=(args.patch_offset_x, args.patch_offset_y), shape=(args.patch_size, args.patch_size))
+            reg_patch = reg_loader.load_region(level=0,
+                                              offset=(args.patch_offset_x, args.patch_offset_y),
+                                              shape=(args.patch_size, args.patch_size))
+            tgt_patch = tgt_loader.load_region(level=0,
+                                              offset=(args.patch_offset_x, args.patch_offset_y),
+                                              shape=(args.patch_size, args.patch_size))
             plt.subplot(2, 2, 3); plt.imshow(reg_patch); plt.title(f"Registered Patch ({args.patch_size})"); plt.axis('off')
             plt.subplot(2, 2, 4); plt.imshow(tgt_patch); plt.title(f"Target Patch ({args.patch_size})"); plt.axis('off')
         except Exception as e:
@@ -271,18 +222,14 @@ def main():
         he_path, if_path = validate_inputs(args)
         output_dir = pathlib.Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\nWSI Registration Pipeline (H200 Optimized)")
-        print(f"==========================================")
-        print(f"H&E Image: {he_path}")
-        print(f"IF Image: {if_path}")
-        print(f"Output Directory: {output_dir}")
+        print(f"\nWSI Registration Pipeline (H200 Optimized)"); print(f"==========================================")
+        print(f"H&E Image: {he_path}"); print(f"IF Image: {if_path}"); print(f"Output Directory: {output_dir}")
         he_loader, if_loader = load_and_analyze_images(he_path, if_path, args, output_dir)
         success = run_registration(he_path, if_path, output_dir, args)
         if success:
             visualize_results(he_path, if_path, output_dir, args)
-            print("\nRegistration pipeline completed successfully!")
-            print(f"Results saved to: {output_dir}")
-            print("\nOutput files:")
+            print("\nRegistration pipeline completed successfully!"); print(f"Results saved to: {output_dir}")
+            print("\nOutput files:");
             for file in sorted(output_dir.glob("*")):
                 if file.is_file(): print(f"  - {file.name}")
         else:
@@ -292,6 +239,7 @@ def main():
         print(f"Error: {e}")
         if tc.cuda.is_available(): tc.cuda.empty_cache()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
