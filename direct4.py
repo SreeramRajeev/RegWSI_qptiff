@@ -169,19 +169,28 @@ def apply_displacement_field_to_color_image(color_image, displacement_field):
     print(f"  Displacement field shape: {displacement_field.shape}")
     
     h, w = color_image.shape[:2]
+    dh, dw = displacement_field.shape[:2]
     
+    if (h != dh) or (w != dw):
+        print(f"  ⚠️ Resizing displacement field from ({dh}, {dw}) to ({h}, {w})")
+        # Resize each channel separately
+        resized_field = np.zeros((h, w, 2), dtype=np.float32)
+        for i in range(2):
+            resized_field[:, :, i] = cv2.resize(displacement_field[:, :, i], (w, h), interpolation=cv2.INTER_LINEAR)
+        displacement_field = resized_field
+
     # Create coordinate grids
     x, y = np.meshgrid(np.arange(w), np.arange(h))
-    
+
     # Apply displacement
-    # Note: displacement field might be in different coordinate system
     map_x = (x + displacement_field[:, :, 0]).astype(np.float32)
     map_y = (y + displacement_field[:, :, 1]).astype(np.float32)
-    
+
     # Apply transformation
     warped = cv2.remap(color_image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-    
+
     return warped
+
 
 def find_displacement_field(reg_dir, temp_dir):
     """
