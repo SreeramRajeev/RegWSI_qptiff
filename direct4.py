@@ -222,65 +222,177 @@ def create_registration_params():
     return params
 
 #############################################################################
-# IMPROVED DISPLACEMENT FIELD HANDLING
+# ENHANCED DISPLACEMENT FIELD HANDLING AND ROBUST TIFF LOADING
 #############################################################################
 
-def find_displacement_field(reg_dir, temp_dir, case_name='qptiff_reg'):
+def find_displacement_field_comprehensive(reg_dir, temp_dir, case_name='qptiff_reg'):
     """
-    Find displacement field in various possible locations
+    Comprehensive search for displacement field including .mha files
     """
-    possible_paths = [
-        temp_dir / 'displacement_field.npy',
-        temp_dir / f'{case_name}_displacement_field.npy',
-        reg_dir / 'displacement_field.npy',
-        reg_dir / f'{case_name}_displacement_field.npy',
-        reg_dir / 'TEMP' / 'displacement_field.npy',
-        reg_dir / 'TEMP' / f'{case_name}_displacement_field.npy',
+    print("   Comprehensive displacement field search...")
+    
+    # All possible names and locations (including .mha files)
+    possible_locations = [reg_dir, temp_dir, temp_dir / case_name, reg_dir / case_name]
+    possible_names = [
+        'displacement_field.mha',      # ITK/SimpleITK format - MOST LIKELY
+        'displacement_field.npy',
+        f'{case_name}_displacement_field.mha',
+        f'{case_name}_displacement_field.npy',
+        'deformation_field.mha',
+        'deformation_field.npy',
+        f'{case_name}_deformation_field.mha',
+        f'{case_name}_deformation_field.npy',
+        'transform_field.mha',
+        'displacement.mha',
+        'deformation.mha',
+        'field.mha',
+        'transform_field.npy',
+        'displacement.npy',
+        'deformation.npy',
+        'field.npy',
     ]
     
-    for path in possible_paths:
-        if path.exists():
-            print(f"   Found displacement field: {path}")
-            return path
+    # Search in all combinations
+    for location in possible_locations:
+        if not location.exists():
+            continue
+        for name in possible_names:
+            path = location / name
+            if path.exists():
+                print(f"   Found displacement field: {path}")
+                return path
     
-    print("   Displacement field not found in any expected location")
+    # If not found by name, search all relevant files by extension
+    print("   Searching by file extension...")
+    relevant_extensions = ['.mha', '.mhd', '.npy', '.nii', '.nii.gz']
+    for location in possible_locations:
+        if not location.exists():
+            continue
+        for ext in relevant_extensions:
+            for file in location.glob(f"*{ext}"):
+                if any(keyword in file.name.lower() for keyword in ['displacement', 'deformation', 'field', 'transform']):
+                    print(f"   Found potential displacement field by name: {file}")
+                    return file
+    
+    print("   No displacement field found")
     return None
 
-def try_extract_displacement_field(reg_dir, temp_dir, case_name='qptiff_reg'):
+def load_displacement_field_from_mha(mha_path):
     """
-    Try to extract displacement field from registration results
+    Load displacement field from .mha file using SimpleITK
     """
-    print("   Attempting to extract displacement field from results...")
+    print(f"   Loading .mha displacement field: {mha_path}")
     
-    # Look for any .npy files that might contain displacement info
-    npy_files = list(reg_dir.rglob("*.npy"))
-    npy_files.extend(list(temp_dir.rglob("*.npy")))
-    
-    for npy_file in npy_files:
-        try:
-            data = np.load(str(npy_file))
-            print(f"   Found NPY file: {npy_file.name}, shape: {data.shape}")
-            
-            # Check if this looks like a displacement field
-            if len(data.shape) == 3 and data.shape[0] == 2:
-                print(f"   This looks like a displacement field!")
-                return npy_file
-            elif len(data.shape) == 3 and data.shape[2] == 2:
-                print(f"   This looks like a displacement field!")
-                return npy_file
-        except Exception as e:
-            print(f"   Error loading {npy_file.name}: {e}")
-    
-    # Look for other common displacement field formats
-    possible_extensions = ['.mha', '.mhd', '.nii', '.nii.gz']
-    for ext in possible_extensions:
-        disp_files = list(reg_dir.rglob(f"*{ext}"))
-        disp_files.extend(list(temp_dir.rglob(f"*{ext}")))
+    try:
+        import SimpleITK as sitk
         
-        for disp_file in disp_files:
-            if 'displacement' in disp_file.name.lower() or 'deformation' in disp_file.name.lower():
-                print(f"   Found potential displacement field: {disp_file}")
-                # Try to load and convert to numpy
+        # Load the displacement field
+        displacement_image = sitk.ReadImage(str(mha_path))
+        
+        # Convert to numpy array
+        displacement_array = sitk.GetArrayFromImage(displacement_image)
+        
+        print(f"   Original .mha shape: {displacement_array.shape}")
+        print(f"   Original .mha spacing: {displacement_image.GetSpacing()}")
+        print(f"   Original .mha direction: {displacement_image.GetDirection()}")
+        
+        # ITK/SimpleITK typically stores displacement fields as (Z, Y, X, Components)
+        # or (Y, X, Components) for 2D
+        # We need to convert to (Y, X, 2) or (2, Y, X) format for OpenCV
+        
+        if displacement_array.ndim == 4:
+            # 3D case: (Z, Y, X, Components) -> take middle Z slice
+            z_middle = displacement_array.shape[0] // 2
+            displacement_2d = displacement_array[z_middle, :, :, :2]  # Take X,Y components
+            print(f"   Extracted 2D slice from 3D field: {displacement_2d.shape}")
+        elif displacement_array.ndim == 3:
+            # 2D case: (Y, X, Components)
+            displacement_2d = displacement_array[:, :, :2]  # Take X,Y components
+            print(f"   Using 2D field: {displacement_2d.shape}")
+        else:
+            raise ValueError(f"Unexpected displacement field dimensions: {displacement_array.shape}")
+        
+        # Convert from ITK coordinate system to OpenCV
+        # ITK: (X, Y) components in physical coordinates
+        # OpenCV: (X, Y) components in pixel coordinates
+        
+        # Flip Y component if needed (ITK vs OpenCV coordinate system differences)
+        displacement_opencv = displacement_2d.copy()
+        displacement_opencv[:, :, 1] = -displacement_opencv[:, :, 1]  # Flip Y
+        
+        print(f"   Final displacement shape for OpenCV: {displacement_opencv.shape}")
+        print(f"   Displacement range X: [{displacement_opencv[:,:,0].min():.2f}, {displacement_opencv[:,:,0].max():.2f}]")
+        print(f"   Displacement range Y: [{displacement_opencv[:,:,1].min():.2f}, {displacement_opencv[:,:,1].max():.2f}]")
+        
+        return displacement_opencv
+        
+    except ImportError:
+        print("   ❌ SimpleITK not available. Installing...")
+        try:
+            import subprocess
+            subprocess.check_call(['pip', 'install', 'SimpleITK'])
+            print("   ✅ SimpleITK installed, retrying...")
+            
+            # Retry after installation
+            import SimpleITK as sitk
+            displacement_image = sitk.ReadImage(str(mha_path))
+            displacement_array = sitk.GetArrayFromImage(displacement_image)
+            
+            if displacement_array.ndim == 4:
+                z_middle = displacement_array.shape[0] // 2
+                displacement_2d = displacement_array[z_middle, :, :, :2]
+            elif displacement_array.ndim == 3:
+                displacement_2d = displacement_array[:, :, :2]
+            else:
+                raise ValueError(f"Unexpected displacement field dimensions: {displacement_array.shape}")
+            
+            displacement_opencv = displacement_2d.copy()
+            displacement_opencv[:, :, 1] = -displacement_opencv[:, :, 1]  # Flip Y
+            
+            return displacement_opencv
+            
+        except Exception as install_error:
+            print(f"   ❌ Could not install SimpleITK: {install_error}")
+            return None
+    
+    except Exception as e:
+        print(f"   ❌ Error loading .mha file: {e}")
+        return None
+
+
+
+def try_alternative_displacement_extraction(reg_dir, temp_dir, case_name):
+    """
+    Try to extract displacement information from other DeepHistReg outputs
+    """
+    print("   Attempting to extract displacement from other outputs...")
+    
+    # Look for ITK transform files
+    possible_extensions = ['.tfm', '.txt', '.h5']
+    for ext in possible_extensions:
+        for location in [reg_dir, temp_dir, temp_dir / case_name]:
+            if not location.exists():
+                continue
+            for transform_file in location.glob(f"*{ext}"):
+                print(f"   Found transform file: {transform_file}")
+                # For now, just note it exists - would need ITK to parse
+                
+    # Look for warped images that we can use directly
+    warped_files = []
+    for location in [reg_dir, temp_dir, temp_dir / case_name]:
+        if not location.exists():
+            continue
+        warped_files.extend(location.glob("*warped*"))
+        warped_files.extend(location.glob("*registered*"))
+        warped_files.extend(location.glob("*result*"))
+    
+    print(f"   Found {len(warped_files)} potential result files")
+    for wf in warped_files:
+        print(f"     {wf.name} ({wf.stat().st_size} bytes)")
+    
+    return warped_files
+
+
                 try:
                     # This would require SimpleITK or similar
                     print(f"   Found displacement field in {ext} format: {disp_file.name}")
@@ -414,6 +526,54 @@ def load_warped_result_robust(warped_path):
         return warped
     except Exception as e:
         print(f"   ❌ skimage failed: {e}")
+    
+    # Method 6: Try reading as binary and reconstructing
+    try:
+        print("   Trying binary reconstruction...")
+        with open(warped_path, 'rb') as f:
+            # Read first few bytes to check format
+            header = f.read(16)
+            print(f"   File header: {header}")
+            
+        # Try using imageio
+        import imageio
+        warped = imageio.imread(str(warped_path))
+        print(f"   ✅ Success with imageio, shape: {warped.shape}")
+        return warped
+    except Exception as e:
+        print(f"   ❌ imageio failed: {e}")
+    
+    # Method 7: Try with different tifffile engines
+    try:
+        print("   Trying tifffile with different options...")
+        # Try with different options
+        warped = tifffile.imread(str(warped_path), is_ome=False)
+        print(f"   ✅ Success with non-OME mode, shape: {warped.shape}")
+        return warped
+    except Exception as e:
+        print(f"   ❌ Non-OME mode failed: {e}")
+    
+    # Method 8: Try to convert the file first
+    try:
+        print("   Trying file conversion...")
+        # Create a temporary converted file
+        temp_path = warped_path.parent / f"temp_converted_{warped_path.stem}.tiff"
+        
+        # Use PIL to open and re-save in a compatible format
+        from PIL import Image
+        with Image.open(str(warped_path)) as img:
+            img.save(str(temp_path), 'TIFF', compression='lzw')
+        
+        # Try to load the converted file
+        warped = tifffile.imread(str(temp_path))
+        
+        # Clean up
+        temp_path.unlink()
+        
+        print(f"   ✅ Success with conversion, shape: {warped.shape}")
+        return warped
+    except Exception as e:
+        print(f"   ❌ Conversion failed: {e}")
     
     print("   ❌ All loading methods failed")
     return None
@@ -560,123 +720,118 @@ def register_qptiff_direct_color(he_qptiff_path: Path, if_qptiff_path: Path,
             if file.is_file():
                 print(f"     {file.relative_to(temp_dir)} ({file.stat().st_size} bytes)")
         
+        # Look for ANY displacement/deformation field files
+        print(f"\n   Debug: Searching for displacement fields...")
+        all_npy_files = list(reg_dir.rglob("*.npy")) + list(temp_dir.rglob("*.npy"))
+        for npy_file in all_npy_files:
+            try:
+                data = np.load(str(npy_file))
+                print(f"     NPY file: {npy_file.name}, shape: {data.shape}, dtype: {data.dtype}")
+            except Exception as e:
+                print(f"     NPY file: {npy_file.name} (error loading: {e})")
+        
+        # Look for transform files
+        transform_exts = ['.txt', '.tfm', '.h5', '.mat']
+        for ext in transform_exts:
+            transform_files = list(reg_dir.rglob(f"*{ext}")) + list(temp_dir.rglob(f"*{ext}"))
+            for tf in transform_files:
+                print(f"     Transform file: {tf.name} ({tf.stat().st_size} bytes)")
+        
         # Step 5: Apply transformation with improved handling
         print("\n5. Applying transformation to original color H&E...")
         
-        # Try to find displacement field
-        disp_field_path = find_displacement_field(reg_dir, temp_dir, 'qptiff_color_reg')
+        # Step 5: Apply transformation to original color H&E
+        print("\n5. Applying transformation to original color H&E...")
         
-        # If not found, try to extract from other files
-        if disp_field_path is None:
-            disp_field_path = try_extract_displacement_field(reg_dir, temp_dir, 'qptiff_color_reg')
+        # Try comprehensive displacement field search
+        disp_field_path = find_displacement_field_comprehensive(reg_dir, temp_dir, 'qptiff_color_reg')
         
         warped_color = None
         
         if disp_field_path:
             try:
-                displacement_field = np.load(str(disp_field_path))
-                print(f"   Displacement field shape: {displacement_field.shape}")
+                # Load displacement field based on file extension
+                if disp_field_path.suffix.lower() == '.mha':
+                    displacement_field = load_displacement_field_from_mha(disp_field_path)
+                elif disp_field_path.suffix.lower() == '.npy':
+                    displacement_field = np.load(str(disp_field_path))
+                    print(f"   Displacement field shape: {displacement_field.shape}")
+                else:
+                    print(f"   Unsupported displacement field format: {disp_field_path.suffix}")
+                    displacement_field = None
                 
-                # Apply to original color image
-                warped_color = apply_displacement_field_to_color(he_original_color, displacement_field)
-                
-                if warped_color is not None:
-                    # Save final result
-                    final_output_path = output_dir / "registered_HE_color.tiff"
-                    tifffile.imwrite(
-                        final_output_path,
-                        warped_color,
-                        photometric='rgb',
-                        compression='lzw',
-                        bigtiff=True
-                    )
+                if displacement_field is not None:
+                    # Apply to original color image
+                    warped_color = apply_displacement_field_to_color(he_original_color, displacement_field)
                     
-                    print(f"   ✅ Color registration saved: {final_output_path.name}")
-                    print(f"   Output dimensions: {warped_color.shape}")
-                    
-                    results['success'] = True
-                    results['registered_path'] = final_output_path
-                    results['displacement_field'] = disp_field_path
-                    results['elapsed_time'] = elapsed
-                    results['output_shape'] = warped_color.shape
-                    results['preprocessing_method'] = preprocessing_method
+                    if warped_color is not None:
+                        # Save final result
+                        final_output_path = output_dir / "registered_HE_color.tiff"
+                        tifffile.imwrite(
+                            final_output_path,
+                            warped_color,
+                            photometric='rgb',
+                            compression='lzw',
+                            bigtiff=True
+                        )
+                        
+                        print(f"   ✅ Color registration saved: {final_output_path.name}")
+                        print(f"   Output dimensions: {warped_color.shape}")
+                        
+                        results['success'] = True
+                        results['registered_path'] = final_output_path
+                        results['displacement_field'] = disp_field_path
+                        results['elapsed_time'] = elapsed
+                        results['output_shape'] = warped_color.shape
+                        results['preprocessing_method'] = preprocessing_method
                 
             except Exception as e:
                 print(f"   ❌ Error applying displacement field: {e}")
                 import traceback
                 traceback.print_exc()
         
-        # Fallback: Try to find and use warped result directly
+        # If displacement field method failed, try alternative extraction
         if warped_color is None:
-            print("\n   Trying to find warped result directly...")
-            warped_path = find_warped_result(reg_dir, 'qptiff_color_reg')
+            warped_files = try_alternative_displacement_extraction(reg_dir, temp_dir, 'qptiff_color_reg')
             
-            if warped_path:
-                warped_color = load_warped_result_robust(warped_path)
-                
-                if warped_color is not None:
-                    # Save as color result
-                    final_output_path = output_dir / "registered_HE_from_warped.tiff"
-                    tifffile.imwrite(
-                        final_output_path,
-                        warped_color,
-                        photometric='rgb',
-                        compression='lzw',
-                        bigtiff=True
-                    )
+            # Try to load each warped file with robust methods
+            for warped_file in warped_files:
+                if 'tiff' in warped_file.suffix.lower():
+                    print(f"\n   Trying to load: {warped_file.name}")
+                    loaded_result = load_warped_result_robust(warped_file)
                     
-                    print(f"   ✅ Warped result saved: {final_output_path.name}")
-                    results['success'] = True
-                    results['registered_path'] = final_output_path
-                    results['method'] = 'direct_warped'
-                    results['preprocessing_method'] = preprocessing_method
-                    results['elapsed_time'] = elapsed
-                else:
-                    print("   ❌ Could not load warped result with any method")
-        
-        # Last resort: Try to create a simple transformation if we have both original and warped
-        if warped_color is None:
-            print("\n   Last resort: Trying to create simple transformation...")
-            
-            # Try to find any result files that might help
-            result_files = list(reg_dir.glob("*.tiff")) + list(reg_dir.glob("*.tif"))
-            print(f"   Found {len(result_files)} TIFF files in registration directory")
-            
-            for result_file in result_files:
-                print(f"   Checking: {result_file.name}")
-                try:
-                    # Try to load with our robust method
-                    test_img = load_warped_result_robust(result_file)
-                    if test_img is not None:
-                        print(f"   ✅ Successfully loaded {result_file.name}")
+                    if loaded_result is not None:
+                        # Resize to match original IF dimensions if needed
+                        if loaded_result.shape[:2] != target_shape[:2]:
+                            loaded_result = cv2.resize(loaded_result, (target_shape[1], target_shape[0]))
                         
-                        # If this looks like a reasonable result, use it
-                        if test_img.shape[:2] == target_shape[:2]:
-                            warped_color = test_img
-                            
-                            final_output_path = output_dir / f"registered_HE_from_{result_file.stem}.tiff"
-                            tifffile.imwrite(
-                                final_output_path,
-                                warped_color,
-                                photometric='rgb',
-                                compression='lzw',
-                                bigtiff=True
-                            )
-                            
-                            print(f"   ✅ Saved result from {result_file.name}")
-                            results['success'] = True
-                            results['registered_path'] = final_output_path
-                            results['method'] = f'from_{result_file.stem}'
-                            results['preprocessing_method'] = preprocessing_method
-                            results['elapsed_time'] = elapsed
-                            break
-                except Exception as e:
-                    print(f"   ❌ Could not load {result_file.name}: {e}")
+                        # Save result
+                        final_output_path = output_dir / f"registered_HE_from_{warped_file.stem}.tiff"
+                        tifffile.imwrite(
+                            final_output_path,
+                            loaded_result,
+                            photometric='rgb',
+                            compression='lzw',
+                            bigtiff=True
+                        )
+                        
+                        print(f"   ✅ Successfully saved result from {warped_file.name}")
+                        warped_color = loaded_result
+                        results['success'] = True
+                        results['registered_path'] = final_output_path
+                        results['method'] = f'direct_from_{warped_file.stem}'
+                        results['preprocessing_method'] = preprocessing_method
+                        results['elapsed_time'] = elapsed
+                        break
         
         if warped_color is None:
             print("   ❌ No usable registration result found")
+            print("   Available files for debugging:")
+            for file in sorted(reg_dir.rglob("*")):
+                if file.is_file():
+                    print(f"     {file.name}: {file.stat().st_size} bytes")
             results['success'] = False
-            results['error'] = "No displacement field or warped result found"
+            results['error'] = "No displacement field or usable warped result found"
         
         # Step 6: Create visualizations
         if warped_color is not None:
