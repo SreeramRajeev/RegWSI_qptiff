@@ -1,516 +1,610 @@
 #!/usr/bin/env python3
 """
-WSI Registration Script using DeeperHistReg
-Registers two whole slide images (WSI) in qptiff format.
-
-Usage:
-    python registration.py \
-      --he-qptiff /path/to/he.qptiff \
-      --if-qptiff /path/to/if.qptiff \
-      --output-dir ./output
+Simple Color QPTIFF Registration Pipeline
+==========================================
+Simplified version that focuses on reliability while preserving color
+Goes back to proven approaches with minimal preprocessing
 """
 
-import argparse
-import pathlib
+### System Imports ###
+import os
 import sys
-from typing import Union
+import time
+import shutil
+from pathlib import Path
+from datetime import datetime
+from typing import Union, Tuple, Optional, Dict
 
-### External Imports ###
+### Scientific Computing ###
 import numpy as np
 import torch as tc
+from scipy.ndimage import map_coordinates
+
+### Image Processing ###
+import cv2
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import os
 
-# GPU Optimization for H200
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use first GPU
-tc.cuda.empty_cache()  # Clear GPU cache
-
-### DeeperHistReg Imports ###
+### DeepHistReg ###
 import deeperhistreg
-from deeperhistreg.dhr_input_output.dhr_loaders import tiff_loader
 from deeperhistreg.dhr_pipeline.registration_params import default_initial_nonrigid
 
+# For handling .mha files
+try:
+    import SimpleITK as sitk
+    SITK_AVAILABLE = True
+except ImportError:
+    SITK_AVAILABLE = False
 
-def setup_gpu_environment():
-    """Setup GPU environment for H200."""
-    print("Setting up GPU environment...")
-    
-    # Check CUDA availability
-    if tc.cuda.is_available():
-        gpu_name = tc.cuda.get_device_name(0)
-        gpu_memory = tc.cuda.get_device_properties(0).total_memory / 1024**3
-        print(f"GPU: {gpu_name}")
-        print(f"GPU Memory: {gpu_memory:.1f} GB")
-        print(f"CUDA Version: {tc.version.cuda}")
-        print(f"PyTorch Version: {tc.__version__}")
-        
-        # Set GPU memory fraction to avoid OOM
-        tc.cuda.set_per_process_memory_fraction(0.9)
-        
-        # Enable optimizations
-        tc.backends.cudnn.benchmark = True
-        tc.backends.cudnn.deterministic = False
-        
-        return True
-    else:
-        print("Warning: CUDA not available, using CPU")
-        return False
+#############################################################################
+# CONFIGURATION
+#############################################################################
 
+# GPU settings
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
-def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Register two WSI qptiff images using DeeperHistReg",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    
-    parser.add_argument(
-        "--he-qptiff", 
-        required=True, 
-        type=str,
-        help="Path to the H&E stained WSI qptiff file (source image)"
-    )
-    
-    parser.add_argument(
-        "--if-qptiff", 
-        required=True, 
-        type=str,
-        help="Path to the IF stained WSI qptiff file (target image)"
-    )
-    
-    parser.add_argument(
-        "--output-dir", 
-        required=True, 
-        type=str,
-        help="Output directory for registration results"
-    )
-    
-    parser.add_argument(
-        "--registration-level", 
-        default=0, 
-        type=int,
-        help="Pyramid level for registration (0 = highest resolution)"
-    )
-    
-    parser.add_argument(
-        "--save-displacement-field", 
-        action="store_true",
-        help="Save the displacement field for further analysis"
-    )
-    
-    parser.add_argument(
-        "--copy-target", 
-        action="store_true",
-        help="Copy the target image to output directory"
-    )
-    
-    parser.add_argument(
-        "--keep-temp", 
-        action="store_true",
-        help="Keep temporary files after registration"
-    )
-    
-    parser.add_argument(
-        "--visualize", 
-        action="store_true",
-        help="Generate visualization plots before and after registration"
-    )
-    
-    parser.add_argument(
-        "--patch-size", 
-        default=1024, 
-        type=int,
-        help="Size of patches for visualization"
-    )
-    
-    parser.add_argument(
-        "--patch-offset-x", 
-        default=1000, 
-        type=int,
-        help="X offset for patch extraction"
-    )
-    
-    parser.add_argument(
-        "--patch-offset-y", 
-        default=1000, 
-        type=int,
-        help="Y offset for patch extraction"
-    )
-    
-    parser.add_argument(
-        "--gpu-memory-fraction", 
-        default=0.9, 
-        type=float,
-        help="Fraction of GPU memory to use (0.1-1.0)"
-    )
-    
-    parser.add_argument(
-        "--batch-size", 
-        default=None, 
-        type=int,
-        help="Batch size for processing (auto-determined if not set)"
-    )
-    
-    parser.add_argument(
-        "--num-workers", 
-        default=4, 
-        type=int,
-        help="Number of data loading workers"
-    )
-    
-    return parser.parse_args()
+# Default IF channels to extract
+DEFAULT_IF_CHANNELS = [0, 1, 5]  # DAPI, CD8, CD163
 
+#############################################################################
+# SIMPLE BUT EFFECTIVE PREPROCESSING
+#############################################################################
 
-def validate_inputs(args):
-    """Validate input arguments."""
-    he_path = pathlib.Path(args.he_qptiff)
-    if_path = pathlib.Path(args.if_qptiff)
+def preprocess_simple_color(source, target):
+    """
+    Simple color preprocessing that works reliably
+    Minimal enhancement to avoid DeepHistReg issues
+    """
+    print("  Applying simple color preprocessing...")
     
-    if not he_path.exists():
-        raise FileNotFoundError(f"H&E qptiff file not found: {he_path}")
+    # Ensure same dimensions
+    if source.shape[:2] != target.shape[:2]:
+        print(f"  Resizing source from {source.shape} to match target {target.shape}")
+        source = cv2.resize(source, (target.shape[1], target.shape[0]), 
+                           interpolation=cv2.INTER_LINEAR)
     
-    if not if_path.exists():
-        raise FileNotFoundError(f"IF qptiff file not found: {if_path}")
+    # Ensure both are 3-channel RGB uint8
+    if source.ndim == 2:
+        source = cv2.cvtColor(source, cv2.COLOR_GRAY2RGB)
+    if target.ndim == 2:
+        target = cv2.cvtColor(target, cv2.COLOR_GRAY2RGB)
     
-    if not he_path.suffix.lower() in ['.qptiff', '.tiff', '.tif']:
-        raise ValueError(f"H&E file must be a qptiff/tiff file: {he_path}")
+    source = source.astype(np.uint8)
+    target = target.astype(np.uint8)
     
-    if not if_path.suffix.lower() in ['.qptiff', '.tiff', '.tif']:
-        raise ValueError(f"IF file must be a qptiff/tiff file: {if_path}")
+    # Very light enhancement only
+    # Apply gentle CLAHE per channel
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     
-    return he_path, if_path
+    source_enhanced = source.copy()
+    target_enhanced = target.copy()
+    
+    for i in range(3):
+        source_enhanced[:, :, i] = clahe.apply(source[:, :, i])
+        target_enhanced[:, :, i] = clahe.apply(target[:, :, i])
+    
+    # Very light Gaussian blur to reduce noise
+    source_final = cv2.GaussianBlur(source_enhanced, (3, 3), 0.5)
+    target_final = cv2.GaussianBlur(target_enhanced, (3, 3), 0.5)
+    
+    return source_final, target_final
 
-
-def load_and_analyze_images(he_path, if_path, args, output_dir):
-    """Load images and perform analysis without visualization."""
-    print("Loading images...")
+def create_simple_registration_params():
+    """
+    Simple registration parameters that work reliably
+    Based on proven configurations
+    """
+    params = default_initial_nonrigid()
     
-    # Load images
-    he_loader = tiff_loader.TIFFLoader(he_path)
-    if_loader = tiff_loader.TIFFLoader(if_path)
-    
-    he_image = he_loader.load_level(level=args.registration_level)
-    if_image = if_loader.load_level(level=args.registration_level)
-    
-    print(f"H&E image shape: {he_image.shape}")
-    print(f"IF image shape: {if_image.shape}")
-    
-    # Calculate image statistics
-    he_stats = {
-        'mean': np.mean(he_image),
-        'std': np.std(he_image),
-        'min': np.min(he_image),
-        'max': np.max(he_image)
+    # Simple feature-based alignment
+    params['initial_alignment_params'] = {
+        'type': 'feature_based',
+        'detector': 'superpoint',
+        'matcher': 'superglue',
+        'ransac_threshold': 10.0,
+        'max_features': 10000,
+        'match_ratio': 0.9,
+        'use_mutual_best': False,
+        'nms_radius': 4,
+        'keypoint_threshold': 0.005,
+        'max_keypoints': -1,
+        'remove_borders': 4,
     }
     
-    if_stats = {
-        'mean': np.mean(if_image),
-        'std': np.std(if_image),
-        'min': np.min(if_image),
-        'max': np.max(if_image)
+    # Conservative nonrigid parameters
+    params['nonrigid_params'] = {
+        'type': 'demons',
+        'iterations': [200, 150, 100, 50],
+        'smoothing_sigma': 3.0,
+        'update_field_sigma': 2.0,
+        'max_step_length': 5.0,
+        'use_histogram_matching': True,
+        'use_symmetric_forces': True,
+        'use_gradient_type': 'symmetric',
     }
     
-    print(f"H&E stats - Mean: {he_stats['mean']:.2f}, Std: {he_stats['std']:.2f}, Range: [{he_stats['min']}-{he_stats['max']}]")
-    print(f"IF stats - Mean: {if_stats['mean']:.2f}, Std: {if_stats['std']:.2f}, Range: [{if_stats['min']}-{if_stats['max']}]")
+    # Standard multi-resolution
+    params['multiresolution_params'] = {
+        'levels': 5,
+        'shrink_factors': [16, 8, 4, 2, 1],
+        'smoothing_sigmas': [8.0, 4.0, 2.0, 1.0, 0.5],
+    }
     
-    if args.visualize:
-        print("Creating pre-registration visualizations...")
-        
-        # Create output directory for visualizations
-        viz_dir = output_dir / "visualizations"
-        viz_dir.mkdir(exist_ok=True)
-        
-        # Use Agg backend for headless operation
-        plt.switch_backend('Agg')
-        
-        # Full images
-        plt.figure(figsize=(15, 10), dpi=150)
-        plt.subplot(2, 2, 1)
-        plt.imshow(he_image)
-        plt.title("H&E Image (Source)")
-        plt.axis('off')
-        
-        plt.subplot(2, 2, 2)
-        plt.imshow(if_image)
-        plt.title("IF Image (Target)")
-        plt.axis('off')
-        
-        # Patches
-        try:
-            he_patch = he_loader.load_region(
-                level=args.registration_level, 
-                offset=(args.patch_offset_x, args.patch_offset_y), 
-                shape=(args.patch_size, args.patch_size)
-            )
-            if_patch = if_loader.load_region(
-                level=args.registration_level, 
-                offset=(args.patch_offset_x, args.patch_offset_y), 
-                shape=(args.patch_size, args.patch_size)
-            )
-            
-            plt.subplot(2, 2, 3)
-            plt.imshow(he_patch)
-            plt.title(f"H&E Patch ({args.patch_size}x{args.patch_size})")
-            plt.axis('off')
-            
-            plt.subplot(2, 2, 4)
-            plt.imshow(if_patch)
-            plt.title(f"IF Patch ({args.patch_size}x{args.patch_size})")
-            plt.axis('off')
-            
-            print(f"H&E patch shape: {he_patch.shape}")
-            print(f"IF patch shape: {if_patch.shape}")
-            
-        except Exception as e:
-            print(f"Warning: Could not extract patches: {e}")
-        
-        plt.tight_layout()
-        plt.savefig(viz_dir / "pre_registration.png", bbox_inches='tight')
-        plt.close()
-        
-        print(f"Pre-registration visualization saved to: {viz_dir / 'pre_registration.png'}")
+    # Standard optimization
+    params['optimization_params'] = {
+        'metric': 'mattes_mutual_information',
+        'number_of_bins': 32,
+        'optimizer': 'gradient_descent',
+        'learning_rate': 2.0,
+        'min_step': 0.001,
+        'iterations': 500,
+        'relaxation_factor': 0.8,
+        'gradient_magnitude_tolerance': 1e-6,
+        'metric_sampling_strategy': 'random',
+        'metric_sampling_percentage': 0.1,
+    }
     
-    return he_loader, if_loader
+    # Standard loading
+    params['loading_params']['loader'] = 'tiff'
+    params['loading_params']['downsample_factor'] = 1
+    
+    # Ensure displacement field is saved
+    params['save_displacement_field'] = True
+    
+    return params
 
+#############################################################################
+# DISPLACEMENT FIELD HANDLING
+#############################################################################
 
-def run_registration(he_path, if_path, output_dir, args):
-    """Run the registration process."""
-    print("Setting up registration configuration...")
+def find_displacement_field_robust(reg_dir, temp_dir, case_name):
+    """
+    Comprehensive search for displacement field
+    """
+    search_dirs = [temp_dir, reg_dir, reg_dir / 'TEMP']
     
-    # Define registration parameters
-    registration_params = default_initial_nonrigid()
-    registration_params['loading_params']['loader'] = 'tiff'  # For qptiff/tiff formats
+    # Add case-specific directories
+    for base_dir in [temp_dir, reg_dir]:
+        case_dir = base_dir / case_name
+        if case_dir.exists():
+            search_dirs.append(case_dir)
+            search_dirs.append(case_dir / 'Results_Final')
     
-    # GPU-specific optimizations for H200
-    if tc.cuda.is_available():
-        registration_params['device'] = 'cuda'
-        registration_params['mixed_precision'] = True  # Enable mixed precision for H200
+    search_patterns = [
+        'displacement_field.*',
+        f'{case_name}_displacement_field.*',
+        'deformation_field.*',
+        f'{case_name}_deformation_field.*',
+        '*displacement*',
+        '*deformation*',
+    ]
+    
+    print(f"   Searching for displacement field in {len(search_dirs)} directories...")
+    
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+            
+        print(f"   Checking: {search_dir}")
+        for pattern in search_patterns:
+            matches = list(search_dir.glob(pattern))
+            for match in matches:
+                if match.is_file():
+                    print(f"   Found potential displacement field: {match}")
+                    return match
+    
+    return None
+
+def load_displacement_field_robust(filepath):
+    """
+    Load displacement field from various formats
+    """
+    filepath = Path(filepath)
+    print(f"   Loading displacement field: {filepath.name}")
+    
+    if filepath.suffix == '.npy':
+        return np.load(str(filepath))
+    
+    elif filepath.suffix == '.mha':
+        if not SITK_AVAILABLE:
+            raise ImportError("SimpleITK required for .mha files")
         
-        # Adjust batch size based on GPU memory
-        if args.batch_size is not None:
-            registration_params['batch_size'] = args.batch_size
+        displacement_image = sitk.ReadImage(str(filepath))
+        displacement_array = sitk.GetArrayFromImage(displacement_image)
+        
+        # Handle different array formats
+        if displacement_array.ndim == 4:
+            displacement_array = displacement_array[0]
+        
+        if displacement_array.shape[-1] == 2:
+            return displacement_array
+        elif displacement_array.shape[0] == 2:
+            return displacement_array.transpose(1, 2, 0)
         else:
-            # Auto-determine batch size based on available memory
-            gpu_memory_gb = tc.cuda.get_device_properties(0).total_memory / 1024**3
-            if gpu_memory_gb >= 80:  # H200 has ~80GB
-                registration_params['batch_size'] = 8
-            else:
-                registration_params['batch_size'] = 4
+            raise ValueError(f"Unexpected displacement field shape: {displacement_array.shape}")
+    
+    else:
+        raise ValueError(f"Unsupported displacement field format: {filepath.suffix}")
+
+def apply_displacement_field_chunked(image, displacement_field, chunk_size=16384):
+    """
+    Apply displacement field with chunked processing for large images
+    """
+    h, w = image.shape[:2]
+    
+    # Resize displacement field if needed
+    if displacement_field.shape[:2] != (h, w):
+        print(f"   Resizing displacement field from {displacement_field.shape} to {(h, w, 2)}")
+        displacement_field = cv2.resize(displacement_field, (w, h), interpolation=cv2.INTER_LINEAR)
+    
+    # Check if we need chunked processing
+    max_opencv_size = 32767
+    
+    if h <= max_opencv_size and w <= max_opencv_size:
+        print(f"   Applying displacement field directly (size: {h}x{w})")
+        return _apply_displacement_direct(image, displacement_field)
+    else:
+        print(f"   Image too large for OpenCV ({h}x{w}), using chunked processing")
+        return _apply_displacement_chunked(image, displacement_field, chunk_size)
+
+def _apply_displacement_direct(image, displacement_field):
+    """Direct application for smaller images"""
+    h, w = image.shape[:2]
+    
+    x, y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = (x + displacement_field[:, :, 0]).astype(np.float32)
+    map_y = (y + displacement_field[:, :, 1]).astype(np.float32)
+    
+    return cv2.remap(image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+def _apply_displacement_chunked(image, displacement_field, chunk_size):
+    """Chunked processing for large images"""
+    h, w = image.shape[:2]
+    warped = np.zeros_like(image)
+    
+    h_chunks = (h + chunk_size - 1) // chunk_size
+    w_chunks = (w + chunk_size - 1) // chunk_size
+    
+    print(f"   Processing in {h_chunks}x{w_chunks} = {h_chunks * w_chunks} chunks")
+    
+    for i in range(h_chunks):
+        for j in range(w_chunks):
+            h_start = i * chunk_size
+            h_end = min((i + 1) * chunk_size, h)
+            w_start = j * chunk_size
+            w_end = min((j + 1) * chunk_size, w)
+            
+            if (i * w_chunks + j) % 5 == 0:
+                print(f"   Processing chunk {i * w_chunks + j + 1}/{h_chunks * w_chunks}")
+            
+            # Extract displacement for this chunk
+            disp_chunk = displacement_field[h_start:h_end, w_start:w_end]
+            
+            # Create coordinates for sampling
+            y_coords, x_coords = np.mgrid[h_start:h_end, w_start:w_end]
+            sample_x = np.clip(x_coords + disp_chunk[:, :, 0], 0, w - 1)
+            sample_y = np.clip(y_coords + disp_chunk[:, :, 1], 0, h - 1)
+            
+            # Sample from full image
+            try:
+                if image.ndim == 3:
+                    for c in range(image.shape[2]):
+                        warped[h_start:h_end, w_start:w_end, c] = map_coordinates(
+                            image[:, :, c], [sample_y, sample_x], 
+                            order=1, mode='reflect', prefilter=False
+                        )
+                else:
+                    warped[h_start:h_end, w_start:w_end] = map_coordinates(
+                        image, [sample_y, sample_x], 
+                        order=1, mode='reflect', prefilter=False
+                    )
+            except Exception as e:
+                print(f"   Warning: Error in chunk ({i},{j}): {e}")
+                warped[h_start:h_end, w_start:w_end] = image[h_start:h_end, w_start:w_end]
+    
+    return warped.astype(image.dtype)
+
+#############################################################################
+# MAIN REGISTRATION FUNCTION
+#############################################################################
+
+def register_qptiff_simple_color(he_qptiff_path: Path, if_qptiff_path: Path, 
+                                 output_dir: Path, if_channels: list = None) -> Dict:
+    """
+    Simple, reliable color registration
+    """
+    print("\n" + "="*70)
+    print(" SIMPLE COLOR QPTIFF REGISTRATION")
+    print("="*70)
+    
+    if if_channels is None:
+        if_channels = DEFAULT_IF_CHANNELS
+    
+    # Create output directories
+    output_dir.mkdir(parents=True, exist_ok=True)
+    reg_dir = output_dir / "registration_simple"
+    reg_dir.mkdir(exist_ok=True)
+    temp_dir = reg_dir / "TEMP"
+    temp_dir.mkdir(exist_ok=True)
+    
+    results = {}
+    
+    try:
+        # Step 1: Prepare IF image
+        print("\n1. Preparing IF image...")
+        
+        import tifffile
+        
+        with tifffile.TiffFile(if_qptiff_path) as tif:
+            if_data = tif.asarray()
+            print(f"   IF shape: {if_data.shape}")
+            
+            if if_data.ndim == 4:
+                if_data = if_data[0] if if_data.shape[0] < if_data.shape[1] else if_data[:, 0, :, :]
+            
+            if if_data.ndim == 3 and if_data.shape[0] <= 16:
+                selected = []
+                for ch_idx in if_channels[:3]:
+                    if ch_idx < if_data.shape[0]:
+                        ch = if_data[ch_idx]
+                        p1, p99 = np.percentile(ch, [1, 99])
+                        ch_norm = np.clip((ch - p1) / (p99 - p1) * 255, 0, 255).astype(np.uint8)
+                        selected.append(ch_norm)
                 
-        registration_params['num_workers'] = args.num_workers
+                if_rgb = np.stack(selected[:3], axis=-1)
+                if if_rgb.shape[-1] < 3:
+                    padding = np.zeros((*if_rgb.shape[:2], 3 - if_rgb.shape[-1]), dtype=np.uint8)
+                    if_rgb = np.concatenate([if_rgb, padding], axis=-1)
+                
+                print(f"   IF RGB shape: {if_rgb.shape}")
+                
+                # Save IF RGB
+                if_rgb_path = temp_dir / "if_rgb.tiff"
+                tifffile.imwrite(if_rgb_path, if_rgb, photometric='rgb', compression='lzw')
+                target_shape = if_rgb.shape
         
-        print(f"Using GPU with batch size: {registration_params.get('batch_size', 'auto')}")
-    
-    # Create case name
-    case_name = f"{he_path.stem}_{if_path.stem}"
-    
-    # Set up temporary path
-    temporary_path = output_dir / f"{case_name}_TEMP"
-    
-    # Create configuration
-    config = {
-        'source_path': he_path,
-        'target_path': if_path,
-        'output_path': output_dir,
-        'registration_parameters': registration_params,
-        'case_name': case_name,
-        'save_displacement_field': args.save_displacement_field,
-        'copy_target': args.copy_target,
-        'delete_temporary_results': not args.keep_temp,
-        'temporary_path': temporary_path
-    }
-    
-    print("Starting registration...")
-    print(f"Source: {he_path}")
-    print(f"Target: {if_path}")
-    print(f"Output: {output_dir}")
-    print(f"Case name: {case_name}")
-    
-    # Run registration with GPU monitoring
-    try:
-        if tc.cuda.is_available():
-            print(f"Initial GPU memory: {tc.cuda.memory_allocated()/1024**3:.2f} GB")
+        # Step 2: Load H&E image
+        print("\n2. Loading H&E image...")
         
+        with tifffile.TiffFile(he_qptiff_path) as tif:
+            he_data = tif.pages[0].asarray()
+            print(f"   H&E shape: {he_data.shape}")
+            
+            if he_data.ndim == 3 and he_data.shape[0] == 3:
+                he_data = np.transpose(he_data, (1, 2, 0))
+            
+            if he_data.ndim == 2:
+                he_data = cv2.cvtColor(he_data, cv2.COLOR_GRAY2RGB)
+            
+            if he_data.dtype != np.uint8:
+                if he_data.dtype == np.uint16:
+                    he_data = (he_data / 256).astype(np.uint8)
+                else:
+                    he_data = he_data.astype(np.uint8)
+            
+            # Store original for final transformation
+            he_original = he_data.copy()
+            
+            # Resize to match IF
+            if he_data.shape[:2] != target_shape[:2]:
+                print(f"   Resizing H&E from {he_data.shape} to match IF {target_shape}")
+                he_data = cv2.resize(he_data, (target_shape[1], target_shape[0]), 
+                                   interpolation=cv2.INTER_LINEAR)
+                he_original = cv2.resize(he_original, (target_shape[1], target_shape[0]),
+                                       interpolation=cv2.INTER_LINEAR)
+            
+            # Save original H&E
+            he_orig_path = temp_dir / "he_original.tiff"
+            tifffile.imwrite(he_orig_path, he_original, photometric='rgb', compression='lzw')
+        
+        # Step 3: Simple preprocessing
+        print("\n3. Preprocessing images...")
+        he_prep, if_prep = preprocess_simple_color(he_data, if_rgb)
+        
+        # Save preprocessed versions
+        he_prep_path = reg_dir / "he_preprocessed.tiff"
+        if_prep_path = reg_dir / "if_preprocessed.tiff"
+        tifffile.imwrite(he_prep_path, he_prep, photometric='rgb', compression='lzw')
+        tifffile.imwrite(if_prep_path, if_prep, photometric='rgb', compression='lzw')
+        
+        # Step 4: Run DeepHistReg with simple case name
+        print("\n4. Running DeepHistReg registration...")
+        
+        params = create_simple_registration_params()
+        case_name = 'simple_reg'  # Simple case name to avoid issues
+        
+        config = {
+            'source_path': str(he_prep_path),
+            'target_path': str(if_prep_path),
+            'output_path': str(reg_dir),
+            'registration_parameters': params,
+            'case_name': case_name,
+            'save_displacement_field': True,
+            'copy_target': True,
+            'delete_temporary_results': False,
+            'temporary_path': str(temp_dir)
+        }
+        
+        start_time = time.time()
         deeperhistreg.run_registration(**config)
+        elapsed = time.time() - start_time
         
-        if tc.cuda.is_available():
-            print(f"Final GPU memory: {tc.cuda.memory_allocated()/1024**3:.2f} GB")
-            tc.cuda.empty_cache()  # Clean up GPU memory
+        print(f"   ✅ Registration completed in {elapsed:.1f} seconds")
+        
+        # Step 5: Find and apply displacement field
+        print("\n5. Finding and applying displacement field...")
+        
+        disp_field_path = find_displacement_field_robust(reg_dir, temp_dir, case_name)
+        
+        if disp_field_path:
+            try:
+                displacement_field = load_displacement_field_robust(disp_field_path)
+                print(f"   Displacement field shape: {displacement_field.shape}")
+                
+                # Apply to original H&E
+                warped_he = apply_displacement_field_chunked(he_original, displacement_field)
+                
+                # Save result
+                final_output_path = output_dir / "registered_HE_simple_color.tiff"
+                tifffile.imwrite(
+                    final_output_path,
+                    warped_he,
+                    photometric='rgb',
+                    compression='lzw',
+                    bigtiff=True
+                )
+                
+                print(f"   ✅ Registration saved: {final_output_path.name}")
+                print(f"   Output dimensions: {warped_he.shape}")
+                
+                results['success'] = True
+                results['registered_path'] = final_output_path
+                results['displacement_field'] = disp_field_path
+                results['elapsed_time'] = elapsed
+                results['output_shape'] = warped_he.shape
+                
+                # Create visualizations
+                print("\n6. Creating visualizations...")
+                try:
+                    create_visualizations(he_original, if_rgb, warped_he, output_dir)
+                except Exception as e:
+                    print(f"   Warning: Visualization failed: {e}")
+                
+            except Exception as e:
+                print(f"   ❌ Error applying displacement field: {e}")
+                import traceback
+                traceback.print_exc()
+                results['success'] = False
+                results['error'] = f"Displacement field application failed: {e}"
+        
+        else:
+            print("   ❌ No displacement field found!")
+            print("\n   Debug: Listing all files in registration directories:")
             
-        print("Registration completed successfully!")
-        return True
-    except Exception as e:
-        print(f"Registration failed: {e}")
-        if tc.cuda.is_available():
-            tc.cuda.empty_cache()  # Clean up GPU memory even on failure
-        return False
-
-
-def visualize_results(he_path, if_path, output_dir, args):
-    """Create post-registration visualizations."""
-    if not args.visualize:
-        return
-    
-    print("Creating post-registration visualizations...")
-    
-    # Look for registered output
-    registered_source_path = None
-    for ext in ['.tiff', '.tif']:
-        potential_path = output_dir / f"{he_path.stem}_registered{ext}"
-        if potential_path.exists():
-            registered_source_path = potential_path
-            break
-    
-    if registered_source_path is None:
-        print("Warning: Could not find registered source image for visualization")
-        return
-    
-    try:
-        # Load registered source and original target
-        registered_loader = tiff_loader.TIFFLoader(registered_source_path)
-        target_loader = tiff_loader.TIFFLoader(if_path)
-        
-        registered_image = registered_loader.load_level(level=0)
-        target_image = target_loader.load_level(level=0)
-        
-        print(f"Registered image shape: {registered_image.shape}")
-        print(f"Target image shape: {target_image.shape}")
-        
-        # Calculate registration quality metrics
-        reg_stats = {
-            'mean': np.mean(registered_image),
-            'std': np.std(registered_image),
-            'min': np.min(registered_image),
-            'max': np.max(registered_image)
-        }
-        
-        target_stats = {
-            'mean': np.mean(target_image),
-            'std': np.std(target_image),
-            'min': np.min(target_image),
-            'max': np.max(target_image)
-        }
-        
-        print(f"Registered stats - Mean: {reg_stats['mean']:.2f}, Std: {reg_stats['std']:.2f}, Range: [{reg_stats['min']}-{reg_stats['max']}]")
-        print(f"Target stats - Mean: {target_stats['mean']:.2f}, Std: {target_stats['std']:.2f}, Range: [{target_stats['min']}-{target_stats['max']}]")
-        
-        # Create visualization
-        viz_dir = output_dir / "visualizations"
-        viz_dir.mkdir(exist_ok=True)
-        
-        # Use Agg backend for headless operation
-        plt.switch_backend('Agg')
-        
-        plt.figure(figsize=(15, 10), dpi=150)
-        
-        plt.subplot(2, 2, 1)
-        plt.imshow(registered_image)
-        plt.title("Registered H&E Image")
-        plt.axis('off')
-        
-        plt.subplot(2, 2, 2)
-        plt.imshow(target_image)
-        plt.title("Target IF Image")
-        plt.axis('off')
-        
-        # Patches
-        try:
-            registered_patch = registered_loader.load_region(
-                level=0, 
-                offset=(args.patch_offset_x, args.patch_offset_y), 
-                shape=(args.patch_size, args.patch_size)
-            )
-            target_patch = target_loader.load_region(
-                level=0, 
-                offset=(args.patch_offset_x, args.patch_offset_y), 
-                shape=(args.patch_size, args.patch_size)
-            )
+            for directory in [reg_dir, temp_dir]:
+                if directory.exists():
+                    print(f"\n   {directory}:")
+                    for item in sorted(directory.rglob("*")):
+                        if item.is_file():
+                            print(f"     {item.relative_to(directory)} ({item.stat().st_size} bytes)")
             
-            plt.subplot(2, 2, 3)
-            plt.imshow(registered_patch)
-            plt.title(f"Registered H&E Patch ({args.patch_size}x{args.patch_size})")
-            plt.axis('off')
-            
-            plt.subplot(2, 2, 4)
-            plt.imshow(target_patch)
-            plt.title(f"Target IF Patch ({args.patch_size}x{args.patch_size})")
-            plt.axis('off')
-            
-            print(f"Registered patch shape: {registered_patch.shape}")
-            print(f"Target patch shape: {target_patch.shape}")
-            
-        except Exception as e:
-            print(f"Warning: Could not extract post-registration patches: {e}")
-        
-        plt.tight_layout()
-        plt.savefig(viz_dir / "post_registration.png", bbox_inches='tight')
-        plt.close()
-        
-        print(f"Post-registration visualization saved to: {viz_dir / 'post_registration.png'}")
+            results['success'] = False
+            results['error'] = "Displacement field not found"
         
     except Exception as e:
-        print(f"Warning: Could not create post-registration visualization: {e}")
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        results['success'] = False
+        results['error'] = str(e)
+    
+    return results
 
+def create_visualizations(he_original, if_img, warped, output_dir):
+    """Create quality check visualizations"""
+    viz_dir = output_dir / "visualizations"
+    viz_dir.mkdir(exist_ok=True)
+    
+    # Ensure all images have same shape
+    h, w = if_img.shape[:2]
+    if he_original.shape[:2] != (h, w):
+        he_original = cv2.resize(he_original, (w, h))
+    if warped.shape[:2] != (h, w):
+        warped = cv2.resize(warped, (w, h))
+    
+    # Side-by-side comparison
+    comparison = np.hstack([he_original, if_img, warped])
+    cv2.imwrite(str(viz_dir / "side_by_side.jpg"), cv2.cvtColor(comparison, cv2.COLOR_RGB2BGR))
+    
+    # Checkerboard overlay
+    checker_size = max(100, min(h, w) // 20)
+    checkerboard = np.zeros_like(if_img)
+    
+    for i in range(0, h, checker_size):
+        for j in range(0, w, checker_size):
+            if (i//checker_size + j//checker_size) % 2 == 0:
+                checkerboard[i:i+checker_size, j:j+checker_size] = warped[i:i+checker_size, j:j+checker_size]
+            else:
+                checkerboard[i:i+checker_size, j:j+checker_size] = if_img[i:i+checker_size, j:j+checker_size]
+    
+    cv2.imwrite(str(viz_dir / "checkerboard.jpg"), cv2.cvtColor(checkerboard, cv2.COLOR_RGB2BGR))
+    
+    # Overlay blend
+    overlay = cv2.addWeighted(if_img, 0.5, warped, 0.5, 0)
+    cv2.imwrite(str(viz_dir / "overlay.jpg"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    
+    print(f"   ✅ Visualizations saved to: {viz_dir}")
+
+#############################################################################
+# MAIN EXECUTION
+#############################################################################
 
 def main():
-    """Main function."""
-    args = parse_arguments()
+    """Main execution"""
+    import argparse
     
-    try:
-        # Setup GPU environment
-        gpu_available = setup_gpu_environment()
-        
-        if gpu_available:
-            tc.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction)
-            print(f"Set GPU memory fraction to: {args.gpu_memory_fraction}")
-        
-        # Validate inputs
-        he_path, if_path = validate_inputs(args)
-        
-        # Create output directory
-        output_dir = pathlib.Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        print(f"\nWSI Registration Pipeline (H200 Optimized)")
-        print(f"==========================================")
-        print(f"H&E Image: {he_path}")
-        print(f"IF Image: {if_path}")
-        print(f"Output Directory: {output_dir}")
-        print()
-        
-        # Load and analyze images (headless mode)
-        he_loader, if_loader = load_and_analyze_images(he_path, if_path, args, output_dir)
-        
-        # Run registration
-        success = run_registration(he_path, if_path, output_dir, args)
-        
-        if success:
-            # Create post-registration visualizations
-            visualize_results(he_path, if_path, output_dir, args)
-            
-            print("\nRegistration pipeline completed successfully!")
-            print(f"Results saved to: {output_dir}")
-            
-            # List output files
-            print("\nOutput files:")
-            for file in sorted(output_dir.glob("*")):
-                if file.is_file():
-                    print(f"  - {file.name}")
-        else:
-            print("\nRegistration pipeline failed!")
-            sys.exit(1)
-            
-        # Final GPU cleanup
-        if gpu_available:
-            tc.cuda.empty_cache()
-            print(f"Final GPU memory usage: {tc.cuda.memory_allocated()/1024**3:.2f} GB")
-            
-    except Exception as e:
-        print(f"Error: {e}")
-        if tc.cuda.is_available():
-            tc.cuda.empty_cache()
-        sys.exit(1)
-
+    print("\n" + "="*70)
+    print(" SIMPLE COLOR QPTIFF REGISTRATION PIPELINE")
+    print("="*70)
+    print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    parser = argparse.ArgumentParser(description="Simple color QPTIFF registration")
+    parser.add_argument("--he-qptiff", type=str, required=True, help="Path to H&E QPTIFF")
+    parser.add_argument("--if-qptiff", type=str, required=True, help="Path to IF QPTIFF")
+    parser.add_argument("--output-dir", type=str, default="./output", help="Output directory")
+    parser.add_argument("--if-channels", type=int, nargs='+', default=[0, 1, 5], 
+                       help="IF channels to use (default: 0=DAPI, 1=CD8, 5=CD163)")
+    
+    args = parser.parse_args()
+    
+    # Convert to Path objects
+    he_path = Path(args.he_qptiff)
+    if_path = Path(args.if_qptiff)
+    output_dir = Path(args.output_dir)
+    
+    # Validate inputs
+    if not he_path.exists():
+        print(f"❌ H&E file not found: {he_path}")
+        return 1
+    
+    if not if_path.exists():
+        print(f"❌ IF file not found: {if_path}")
+        return 1
+    
+    print(f"\nInput files:")
+    print(f"  H&E: {he_path.name} ({he_path.stat().st_size/1e9:.2f} GB)")
+    print(f"  IF:  {if_path.name} ({if_path.stat().st_size/1e9:.2f} GB)")
+    print(f"  Output: {output_dir}")
+    
+    # Check dependencies
+    if tc.cuda.is_available():
+        print(f"\n✅ GPU available: {tc.cuda.get_device_name(0)}")
+    else:
+        print("\n⚠️  No GPU detected - registration will be slower")
+    
+    if not SITK_AVAILABLE:
+        print("\n⚠️  SimpleITK not available - install with 'pip install SimpleITK' for .mha support")
+    
+    # Run registration
+    results = register_qptiff_simple_color(he_path, if_path, output_dir, args.if_channels)
+    
+    # Summary
+    print("\n" + "="*70)
+    print(" REGISTRATION SUMMARY")
+    print("="*70)
+    
+    if results.get('success'):
+        print(f"✅ Registration completed successfully!")
+        print(f"   Time: {results.get('elapsed_time', 0):.1f} seconds")
+        print(f"   Output: {results['registered_path']}")
+        print(f"   Dimensions: {results.get('output_shape', 'unknown')}")
+    else:
+        print(f"❌ Registration failed: {results.get('error', 'Unknown error')}")
+        return 1
+    
+    print(f"\nCompleted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
