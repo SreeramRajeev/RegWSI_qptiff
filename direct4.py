@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
 """
-Direct QPTIFF Registration Pipeline - COLOR INPUT VERSION
-=========================================================
-Fixed to work with color images throughout the pipeline
-Preserves original color information for better results
-
-Key fixes:
-- Modified preprocessing to work with color images
-- Better color preservation strategy
-- Improved displacement field handling
+Robust QPTIFF Registration Pipeline
+==================================
+Enhanced error handling and fallback mechanisms
 """
 
 ### System Imports ###
@@ -45,15 +39,14 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 DEFAULT_IF_CHANNELS = [0, 1, 5]  # DAPI, CD8, CD163
 
 #############################################################################
-# IMPROVED PREPROCESSING - WORKS WITH COLOR IMAGES
+# ROBUST PREPROCESSING FUNCTIONS
 #############################################################################
 
-def preprocess_for_registration_color(source, target):
+def preprocess_for_registration_simple_robust(source, target):
     """
-    Advanced preprocessing that preserves color information
-    This version works with color images throughout the pipeline
+    Simple but robust preprocessing that avoids complex operations
     """
-    print("  Applying color-preserving preprocessing...")
+    print("  Applying simple robust preprocessing...")
     
     # Ensure same dimensions
     if source.shape[:2] != target.shape[:2]:
@@ -71,364 +64,215 @@ def preprocess_for_registration_color(source, target):
     source = source.astype(np.uint8)
     target = target.astype(np.uint8)
     
-    # METHOD 1: Enhanced color processing per channel
-    source_enhanced = np.zeros_like(source)
-    target_enhanced = np.zeros_like(target)
-    
-    for channel in range(3):
-        # Apply Gaussian blur per channel
-        src_ch = cv2.GaussianBlur(source[:, :, channel], (5, 5), 1.0)
-        tgt_ch = cv2.GaussianBlur(target[:, :, channel], (5, 5), 1.0)
-        
-        # Apply CLAHE per channel
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16,16))
-        src_ch_enhanced = clahe.apply(src_ch)
-        tgt_ch_enhanced = clahe.apply(tgt_ch)
-        
-        source_enhanced[:, :, channel] = src_ch_enhanced
-        target_enhanced[:, :, channel] = tgt_ch_enhanced
-    
-    # METHOD 2: Add structural enhancement using luminance
-    # Convert to LAB color space for better luminance processing
-    source_lab = cv2.cvtColor(source_enhanced, cv2.COLOR_RGB2LAB)
-    target_lab = cv2.cvtColor(target_enhanced, cv2.COLOR_RGB2LAB)
-    
-    # Apply edge enhancement to L channel only
-    source_l = source_lab[:, :, 0]
-    target_l = target_lab[:, :, 0]
-    
-    # Edge detection on luminance
-    source_edges = cv2.Canny(source_l, 30, 100)
-    target_edges = cv2.Canny(target_l, 30, 100)
-    
-    # Combine enhanced luminance with edge information
-    source_l_final = cv2.addWeighted(source_l, 0.8, source_edges, 0.2, 0)
-    target_l_final = cv2.addWeighted(target_l, 0.8, target_edges, 0.2, 0)
-    
-    # Put back the enhanced L channel
-    source_lab[:, :, 0] = source_l_final
-    target_lab[:, :, 0] = target_l_final
-    
-    # Convert back to RGB
-    source_final = cv2.cvtColor(source_lab, cv2.COLOR_LAB2RGB)
-    target_final = cv2.cvtColor(target_lab, cv2.COLOR_LAB2RGB)
-    
-    return source_final, target_final
-
-def preprocess_for_registration_simple_color(source, target):
-    """
-    Simpler color preprocessing that maintains color structure
-    Good fallback if LAB conversion causes issues
-    """
-    print("  Applying simple color preprocessing...")
-    
-    # Ensure same dimensions
-    if source.shape[:2] != target.shape[:2]:
-        print(f"  Resizing source from {source.shape} to match target {target.shape}")
-        source = cv2.resize(source, (target.shape[1], target.shape[0]), 
-                           interpolation=cv2.INTER_LINEAR)
-    
-    # Ensure both are 3-channel RGB
-    if source.ndim == 2:
-        source = cv2.cvtColor(source, cv2.COLOR_GRAY2RGB)
-    if target.ndim == 2:
-        target = cv2.cvtColor(target, cv2.COLOR_GRAY2RGB)
-    
-    # Convert to uint8 if needed
-    source = source.astype(np.uint8)
-    target = target.astype(np.uint8)
-    
-    # Apply light enhancement while preserving color relationships
-    source_enhanced = np.zeros_like(source)
-    target_enhanced = np.zeros_like(target)
-    
-    # Apply CLAHE per channel with gentler settings
+    # Light enhancement - avoid complex LAB operations
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    
+    source_enhanced = np.zeros_like(source)
+    target_enhanced = np.zeros_like(target)
     
     for channel in range(3):
         source_enhanced[:, :, channel] = clahe.apply(source[:, :, channel])
         target_enhanced[:, :, channel] = clahe.apply(target[:, :, channel])
     
-    # Light Gaussian blur to reduce noise
+    # Very light smoothing
     source_final = cv2.GaussianBlur(source_enhanced, (3, 3), 0.5)
     target_final = cv2.GaussianBlur(target_enhanced, (3, 3), 0.5)
     
     return source_final, target_final
 
-def create_registration_params():
-    """Registration parameters optimized for color images"""
+def create_robust_registration_params():
+    """
+    More conservative registration parameters that are less likely to fail
+    """
     params = default_initial_nonrigid()
     
-    # Feature-based initial alignment
+    # Simpler initial alignment
     params['initial_alignment_params'] = {
         'type': 'feature_based',
         'detector': 'superpoint',
         'matcher': 'superglue',
-        'ransac_threshold': 8.0,  # Slightly more tolerant
-        'max_features': 8000,     # Reduced for color images
-        'match_ratio': 0.85,      # More selective matching
-        'use_mutual_best': True,  # Better for color images
+        'ransac_threshold': 10.0,
+        'max_features': 5000,      # Reduced
+        'match_ratio': 0.8,
+        'use_mutual_best': False,  # More conservative
         'nms_radius': 4,
-        'keypoint_threshold': 0.005,
+        'keypoint_threshold': 0.01,  # Less sensitive
         'max_keypoints': -1,
         'remove_borders': 4,
     }
     
-    # Nonrigid parameters - optimized for color
+    # Conservative nonrigid parameters
     params['nonrigid_params'] = {
         'type': 'demons',
-        'iterations': [150, 100, 75, 50],  # Reduced iterations
-        'smoothing_sigma': 2.5,            # Slightly less smoothing
-        'update_field_sigma': 1.5,         # Smaller updates
-        'max_step_length': 3.0,            # Smaller steps
+        'iterations': [100, 75, 50, 25],  # Reduced iterations
+        'smoothing_sigma': 3.0,           # More smoothing
+        'update_field_sigma': 2.0,        # More conservative updates
+        'max_step_length': 2.0,           # Smaller steps
         'use_histogram_matching': True,
-        'use_symmetric_forces': True,
-        'use_gradient_type': 'symmetric',
+        'use_symmetric_forces': False,    # Simpler
+        'use_gradient_type': 'fixed',     # More stable
     }
     
-    # Multi-resolution
+    # Fewer resolution levels
     params['multiresolution_params'] = {
-        'levels': 4,  # Fewer levels for color
-        'shrink_factors': [8, 4, 2, 1],
-        'smoothing_sigmas': [4.0, 2.0, 1.0, 0.5],
+        'levels': 3,  # Fewer levels
+        'shrink_factors': [4, 2, 1],
+        'smoothing_sigmas': [2.0, 1.0, 0.5],
     }
     
-    # Optimization - better for color images
+    # Conservative optimization
     params['optimization_params'] = {
         'metric': 'mattes_mutual_information',
-        'number_of_bins': 64,              # More bins for color
+        'number_of_bins': 32,              # Fewer bins
         'optimizer': 'gradient_descent',
-        'learning_rate': 1.5,              # Slower learning
-        'min_step': 0.0001,                # Smaller minimum step
-        'iterations': 300,                 # Fewer iterations
-        'relaxation_factor': 0.7,          # More relaxation
-        'gradient_magnitude_tolerance': 1e-6,
+        'learning_rate': 1.0,              # Slower
+        'min_step': 0.001,                 # Larger minimum step
+        'iterations': 200,                 # Fewer iterations
+        'relaxation_factor': 0.8,          # More relaxation
+        'gradient_magnitude_tolerance': 1e-5,
         'metric_sampling_strategy': 'random',
-        'metric_sampling_percentage': 0.15,  # More sampling
+        'metric_sampling_percentage': 0.1,  # Less sampling
     }
     
-    # TIFF support
+    # Simple loading parameters
     params['loading_params'] = {
         'loader': 'tiff',
         'downsample_factor': 1,
     }
     
-    # CRITICAL: Ensure displacement field is saved
+    # Output parameters
     params['save_displacement_field'] = True
-    params['save_deformation_field'] = True  # Alternative name
-    params['save_transform_parameters'] = True
-    params['output_displacement_field'] = True
     
     return params
 
-#############################################################################
-# IMPROVED DISPLACEMENT FIELD HANDLING
-#############################################################################
-
-def find_displacement_field(reg_dir, temp_dir, case_name='qptiff_reg'):
+def run_deephistreg_robust(he_path, if_path, output_dir, case_name='robust_reg'):
     """
-    Find displacement field in various possible locations
+    Run DeepHistReg with better error handling and debugging
     """
-    possible_paths = [
-        temp_dir / 'displacement_field.npy',
-        temp_dir / f'{case_name}_displacement_field.npy',
-        reg_dir / 'displacement_field.npy',
-        reg_dir / f'{case_name}_displacement_field.npy',
-        reg_dir / 'TEMP' / 'displacement_field.npy',
-        reg_dir / 'TEMP' / f'{case_name}_displacement_field.npy',
-    ]
+    print("  Running DeepHistReg with robust configuration...")
     
-    for path in possible_paths:
-        if path.exists():
-            print(f"   Found displacement field: {path}")
-            return path
+    # Clean output directory structure
+    reg_dir = output_dir / "registration"
+    temp_dir = reg_dir / "TEMP"
     
-    print("   Displacement field not found in any expected location")
-    return None
-
-def try_extract_displacement_field(reg_dir, temp_dir, case_name='qptiff_reg'):
-    """
-    Try to extract displacement field from registration results
-    """
-    print("   Attempting to extract displacement field from results...")
+    # Ensure clean state
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
     
-    # Look for any .npy files that might contain displacement info
-    npy_files = list(reg_dir.rglob("*.npy"))
-    npy_files.extend(list(temp_dir.rglob("*.npy")))
-    
-    for npy_file in npy_files:
-        try:
-            data = np.load(str(npy_file))
-            print(f"   Found NPY file: {npy_file.name}, shape: {data.shape}")
-            
-            # Check if this looks like a displacement field
-            if len(data.shape) == 3 and data.shape[0] == 2:
-                print(f"   This looks like a displacement field!")
-                return npy_file
-            elif len(data.shape) == 3 and data.shape[2] == 2:
-                print(f"   This looks like a displacement field!")
-                return npy_file
-        except Exception as e:
-            print(f"   Error loading {npy_file.name}: {e}")
-    
-    # Look for other common displacement field formats
-    possible_extensions = ['.mha', '.mhd', '.nii', '.nii.gz']
-    for ext in possible_extensions:
-        disp_files = list(reg_dir.rglob(f"*{ext}"))
-        disp_files.extend(list(temp_dir.rglob(f"*{ext}")))
+    try:
+        params = create_robust_registration_params()
         
-        for disp_file in disp_files:
-            if 'displacement' in disp_file.name.lower() or 'deformation' in disp_file.name.lower():
-                print(f"   Found potential displacement field: {disp_file}")
-                # Try to load and convert to numpy
-                try:
-                    # This would require SimpleITK or similar
-                    print(f"   Found displacement field in {ext} format: {disp_file.name}")
-                    return disp_file
-                except Exception as e:
-                    print(f"   Could not load {disp_file.name}: {e}")
-    
-    return None
+        # Simple configuration
+        config = {
+            'source_path': str(he_path),
+            'target_path': str(if_path),
+            'output_path': str(reg_dir),
+            'registration_parameters': params,
+            'case_name': case_name,
+            'save_displacement_field': True,
+            'copy_target': True,
+            'delete_temporary_results': False,  # Keep for debugging
+            'temporary_path': str(temp_dir)
+        }
+        
+        print(f"  Config: {config}")
+        
+        start_time = time.time()
+        
+        # Try the registration
+        deeperhistreg.run_registration(**config)
+        
+        elapsed = time.time() - start_time
+        print(f"  ✅ DeepHistReg completed in {elapsed:.1f} seconds")
+        
+        return True, elapsed, None
+        
+    except Exception as e:
+        print(f"  ❌ DeepHistReg failed: {e}")
+        
+        # Debug: Show what was created
+        print("  Debug - Files in registration directory:")
+        if reg_dir.exists():
+            for item in reg_dir.rglob("*"):
+                if item.is_file():
+                    print(f"    {item.relative_to(reg_dir)} ({item.stat().st_size} bytes)")
+        
+        print("  Debug - Files in temp directory:")
+        if temp_dir.exists():
+            for item in temp_dir.rglob("*"):
+                if item.is_file():
+                    print(f"    {item.relative_to(temp_dir)} ({item.stat().st_size} bytes)")
+        
+        return False, 0, str(e)
 
-def apply_displacement_field_to_color(color_image, displacement_field):
+def find_any_output_files(reg_dir, temp_dir):
     """
-    Apply displacement field to color image with proper handling
+    Find any usable output files from the registration attempt
     """
-    print("   Applying displacement field to color image...")
+    print("  Searching for any usable output files...")
     
-    h, w = color_image.shape[:2]
+    # Look for warped files
+    search_dirs = [reg_dir, temp_dir]
+    warped_files = []
+    displacement_files = []
     
-    # Handle different displacement field formats
-    if displacement_field.shape[0] == 2:  # Format: (2, H, W)
-        flow = displacement_field.transpose(1, 2, 0)
-    elif displacement_field.shape[-1] == 2:  # Format: (H, W, 2)
-        flow = displacement_field
-    else:
-        print(f"   Unexpected displacement field shape: {displacement_field.shape}")
-        return None
+    for search_dir in search_dirs:
+        if search_dir.exists():
+            # Find warped files
+            warped_files.extend(list(search_dir.rglob("*warped*")))
+            warped_files.extend(list(search_dir.rglob("*registered*")))
+            
+            # Find displacement files
+            displacement_files.extend(list(search_dir.rglob("*.npy")))
+            displacement_files.extend(list(search_dir.rglob("*displacement*")))
+            displacement_files.extend(list(search_dir.rglob("*deformation*")))
     
-    # Ensure flow matches image dimensions
-    if flow.shape[:2] != (h, w):
-        print(f"   Resizing flow from {flow.shape[:2]} to {(h, w)}")
-        flow = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR)
+    print(f"  Found {len(warped_files)} potential warped files")
+    print(f"  Found {len(displacement_files)} potential displacement files")
     
-    # Create coordinate maps
-    x, y = np.meshgrid(np.arange(w), np.arange(h))
-    map_x = (x + flow[:, :, 0]).astype(np.float32)
-    map_y = (y + flow[:, :, 1]).astype(np.float32)
+    for wf in warped_files:
+        print(f"    Warped: {wf}")
+    for df in displacement_files:
+        print(f"    Displacement: {df}")
     
-    # Apply transformation
-    warped = cv2.remap(color_image, map_x, map_y, 
-                       interpolation=cv2.INTER_LINEAR, 
-                       borderMode=cv2.BORDER_CONSTANT, 
-                       borderValue=0)
-    
-    return warped
+    return warped_files, displacement_files
 
-def find_warped_result(reg_dir, case_name='qptiff_reg'):
+def load_image_robust(image_path):
     """
-    Find the warped result file
+    Load image with multiple fallback methods
     """
-    possible_names = [
-        'warped_source.tiff',
-        f'{case_name}_warped_source.tiff',
-        'warped_source.tif',
-        f'{case_name}_warped_source.tif',
+    print(f"  Loading image: {image_path}")
+    
+    methods = [
+        ("tifffile", lambda p: __import__('tifffile').imread(str(p))),
+        ("cv2", lambda p: cv2.cvtColor(cv2.imread(str(p)), cv2.COLOR_BGR2RGB)),
+        ("PIL", lambda p: np.array(__import__('PIL.Image', fromlist=['Image']).open(str(p)))),
+        ("skimage", lambda p: __import__('skimage.io', fromlist=['io']).imread(str(p))),
     ]
     
-    for name in possible_names:
-        path = reg_dir / name
-        if path.exists():
-            print(f"   Found warped result: {path}")
-            return path
+    for method_name, loader in methods:
+        try:
+            img = loader(image_path)
+            if img is not None:
+                print(f"  ✅ Loaded with {method_name}, shape: {img.shape}")
+                return img
+        except Exception as e:
+            print(f"  ❌ {method_name} failed: {e}")
     
-    # Check for any warped files
-    warped_files = list(reg_dir.glob("*warped*"))
-    if warped_files:
-        print(f"   Found warped file: {warped_files[0]}")
-        return warped_files[0]
-    
-    print("   No warped result found")
-    return None
-
-def load_warped_result_robust(warped_path):
-    """
-    Robust loading of warped result with multiple fallback methods
-    """
-    print(f"   Attempting to load: {warped_path}")
-    
-    # Method 1: Try tifffile first
-    try:
-        print("   Trying tifffile...")
-        warped = tifffile.imread(str(warped_path))
-        print(f"   ✅ Success with tifffile, shape: {warped.shape}")
-        return warped
-    except Exception as e:
-        print(f"   ❌ tifffile failed: {e}")
-    
-    # Method 2: Try OpenCV
-    try:
-        print("   Trying OpenCV...")
-        warped = cv2.imread(str(warped_path), cv2.IMREAD_COLOR)
-        if warped is not None:
-            warped = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
-            print(f"   ✅ Success with OpenCV, shape: {warped.shape}")
-            return warped
-        else:
-            print("   ❌ OpenCV returned None")
-    except Exception as e:
-        print(f"   ❌ OpenCV failed: {e}")
-    
-    # Method 3: Try PIL
-    try:
-        print("   Trying PIL...")
-        from PIL import Image
-        pil_img = Image.open(str(warped_path))
-        warped = np.array(pil_img)
-        print(f"   ✅ Success with PIL, shape: {warped.shape}")
-        return warped
-    except Exception as e:
-        print(f"   ❌ PIL failed: {e}")
-    
-    # Method 4: Try with specific tifffile parameters
-    try:
-        print("   Trying tifffile with specific parameters...")
-        with tifffile.TiffFile(str(warped_path)) as tif:
-            print(f"   TIFF info: {len(tif.pages)} pages")
-            for i, page in enumerate(tif.pages):
-                print(f"   Page {i}: {page.shape}, {page.dtype}, compression: {page.compression}")
-            
-            # Try loading the first page
-            warped = tif.pages[0].asarray()
-            print(f"   ✅ Success with specific parameters, shape: {warped.shape}")
-            return warped
-    except Exception as e:
-        print(f"   ❌ Specific tifffile failed: {e}")
-    
-    # Method 5: Try skimage
-    try:
-        print("   Trying skimage...")
-        from skimage import io
-        warped = io.imread(str(warped_path))
-        print(f"   ✅ Success with skimage, shape: {warped.shape}")
-        return warped
-    except Exception as e:
-        print(f"   ❌ skimage failed: {e}")
-    
-    print("   ❌ All loading methods failed")
     return None
 
 #############################################################################
-# MAIN REGISTRATION FUNCTION - IMPROVED
+# MAIN ROBUST REGISTRATION FUNCTION
 #############################################################################
 
-def register_qptiff_direct_color(he_qptiff_path: Path, if_qptiff_path: Path, 
-                                output_dir: Path, if_channels: list = None) -> Dict:
+def register_qptiff_robust(he_qptiff_path: Path, if_qptiff_path: Path, 
+                          output_dir: Path, if_channels: list = None) -> Dict:
     """
-    Register H&E to IF QPTIFF directly at full resolution with color preservation
+    Robust QPTIFF registration with extensive error handling
     """
     print("\n" + "="*70)
-    print(" DIRECT QPTIFF REGISTRATION - COLOR VERSION")
+    print(" ROBUST QPTIFF REGISTRATION")
     print("="*70)
     
     if if_channels is None:
@@ -445,7 +289,7 @@ def register_qptiff_direct_color(he_qptiff_path: Path, if_qptiff_path: Path,
     
     try:
         # Step 1: Load and prepare IF image
-        print("\n1. Preparing IF image...")
+        print("\n1. Loading IF image...")
         import tifffile
         
         with tifffile.TiffFile(if_qptiff_path) as tif:
@@ -507,188 +351,111 @@ def register_qptiff_direct_color(he_qptiff_path: Path, if_qptiff_path: Path,
                 he_original_color = cv2.resize(he_original_color, (target_shape[1], target_shape[0]),
                                              interpolation=cv2.INTER_LINEAR)
         
-        # Step 3: Preprocess with color preservation
-        print("\n3. Preprocessing images with color preservation...")
-        
-        try:
-            # Try advanced color preprocessing first
-            he_prep, if_prep = preprocess_for_registration_color(he_data, if_rgb)
-            preprocessing_method = "advanced_color"
-        except Exception as e:
-            print(f"   Advanced preprocessing failed: {e}")
-            print("   Falling back to simple color preprocessing...")
-            he_prep, if_prep = preprocess_for_registration_simple_color(he_data, if_rgb)
-            preprocessing_method = "simple_color"
+        # Step 3: Simple preprocessing
+        print("\n3. Preprocessing with simple robust method...")
+        he_prep, if_prep = preprocess_for_registration_simple_robust(he_data, if_rgb)
         
         # Save preprocessed versions
-        he_prep_path = reg_dir / "he_preprocessed_color.tiff"
-        if_prep_path = reg_dir / "if_preprocessed_color.tiff"
+        he_prep_path = reg_dir / "he_preprocessed_robust.tiff"
+        if_prep_path = reg_dir / "if_preprocessed_robust.tiff"
         tifffile.imwrite(he_prep_path, he_prep, photometric='rgb', compression='lzw')
         tifffile.imwrite(if_prep_path, if_prep, photometric='rgb', compression='lzw')
         
-        # Step 4: Run DeepHistReg with color images
-        print("\n4. Running DeepHistReg with color images...")
+        print(f"   Preprocessed images saved")
         
-        params = create_registration_params()
+        # Step 4: Run robust registration
+        print("\n4. Running robust registration...")
         
-        config = {
-            'source_path': str(he_prep_path),
-            'target_path': str(if_prep_path),
-            'output_path': str(reg_dir),
-            'registration_parameters': params,
-            'case_name': 'qptiff_color_reg',
-            'save_displacement_field': True,
-            'copy_target': True,
-            'delete_temporary_results': False,
-            'temporary_path': str(temp_dir)
-        }
+        success, elapsed, error = run_deephistreg_robust(
+            he_prep_path, if_prep_path, output_dir, 'robust_reg'
+        )
         
-        start_time = time.time()
-        deeperhistreg.run_registration(**config)
-        elapsed = time.time() - start_time
+        if success:
+            print(f"   ✅ Registration completed successfully")
+            results['registration_success'] = True
+            results['elapsed_time'] = elapsed
+        else:
+            print(f"   ❌ Registration failed: {error}")
+            results['registration_success'] = False
+            results['registration_error'] = error
         
-        print(f"   ✅ Registration completed in {elapsed:.1f} seconds")
+        # Step 5: Try to find and use any output
+        print("\n5. Looking for any usable output...")
         
-        # Debug: Check what files were created
-        print(f"\n   Debug: Files created in registration directory:")
-        for file in sorted(reg_dir.rglob("*")):
-            if file.is_file():
-                print(f"     {file.relative_to(reg_dir)} ({file.stat().st_size} bytes)")
+        warped_files, displacement_files = find_any_output_files(reg_dir, temp_dir)
         
-        print(f"\n   Debug: Files created in temp directory:")
-        for file in sorted(temp_dir.rglob("*")):
-            if file.is_file():
-                print(f"     {file.relative_to(temp_dir)} ({file.stat().st_size} bytes)")
+        final_result = None
         
-        # Step 5: Apply transformation with improved handling
-        print("\n5. Applying transformation to original color H&E...")
-        
-        # Try to find displacement field
-        disp_field_path = find_displacement_field(reg_dir, temp_dir, 'qptiff_color_reg')
-        
-        # If not found, try to extract from other files
-        if disp_field_path is None:
-            disp_field_path = try_extract_displacement_field(reg_dir, temp_dir, 'qptiff_color_reg')
-        
-        warped_color = None
-        
-        if disp_field_path:
+        # Try displacement field method first
+        for disp_file in displacement_files:
             try:
-                displacement_field = np.load(str(disp_field_path))
-                print(f"   Displacement field shape: {displacement_field.shape}")
+                print(f"   Trying displacement file: {disp_file}")
+                disp_field = np.load(str(disp_file))
+                print(f"   Displacement shape: {disp_field.shape}")
                 
                 # Apply to original color image
-                warped_color = apply_displacement_field_to_color(he_original_color, displacement_field)
-                
-                if warped_color is not None:
-                    # Save final result
-                    final_output_path = output_dir / "registered_HE_color.tiff"
-                    tifffile.imwrite(
-                        final_output_path,
-                        warped_color,
-                        photometric='rgb',
-                        compression='lzw',
-                        bigtiff=True
-                    )
-                    
-                    print(f"   ✅ Color registration saved: {final_output_path.name}")
-                    print(f"   Output dimensions: {warped_color.shape}")
-                    
-                    results['success'] = True
-                    results['registered_path'] = final_output_path
-                    results['displacement_field'] = disp_field_path
-                    results['elapsed_time'] = elapsed
-                    results['output_shape'] = warped_color.shape
-                    results['preprocessing_method'] = preprocessing_method
-                
-            except Exception as e:
-                print(f"   ❌ Error applying displacement field: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # Fallback: Try to find and use warped result directly
-        if warped_color is None:
-            print("\n   Trying to find warped result directly...")
-            warped_path = find_warped_result(reg_dir, 'qptiff_color_reg')
-            
-            if warped_path:
-                warped_color = load_warped_result_robust(warped_path)
-                
-                if warped_color is not None:
-                    # Save as color result
-                    final_output_path = output_dir / "registered_HE_from_warped.tiff"
-                    tifffile.imwrite(
-                        final_output_path,
-                        warped_color,
-                        photometric='rgb',
-                        compression='lzw',
-                        bigtiff=True
-                    )
-                    
-                    print(f"   ✅ Warped result saved: {final_output_path.name}")
-                    results['success'] = True
-                    results['registered_path'] = final_output_path
-                    results['method'] = 'direct_warped'
-                    results['preprocessing_method'] = preprocessing_method
-                    results['elapsed_time'] = elapsed
+                h, w = target_shape[:2]
+                if disp_field.shape[0] == 2:
+                    flow = disp_field.transpose(1, 2, 0)
                 else:
-                    print("   ❌ Could not load warped result with any method")
-        
-        # Last resort: Try to create a simple transformation if we have both original and warped
-        if warped_color is None:
-            print("\n   Last resort: Trying to create simple transformation...")
-            
-            # Try to find any result files that might help
-            result_files = list(reg_dir.glob("*.tiff")) + list(reg_dir.glob("*.tif"))
-            print(f"   Found {len(result_files)} TIFF files in registration directory")
-            
-            for result_file in result_files:
-                print(f"   Checking: {result_file.name}")
-                try:
-                    # Try to load with our robust method
-                    test_img = load_warped_result_robust(result_file)
-                    if test_img is not None:
-                        print(f"   ✅ Successfully loaded {result_file.name}")
-                        
-                        # If this looks like a reasonable result, use it
-                        if test_img.shape[:2] == target_shape[:2]:
-                            warped_color = test_img
-                            
-                            final_output_path = output_dir / f"registered_HE_from_{result_file.stem}.tiff"
-                            tifffile.imwrite(
-                                final_output_path,
-                                warped_color,
-                                photometric='rgb',
-                                compression='lzw',
-                                bigtiff=True
-                            )
-                            
-                            print(f"   ✅ Saved result from {result_file.name}")
-                            results['success'] = True
-                            results['registered_path'] = final_output_path
-                            results['method'] = f'from_{result_file.stem}'
-                            results['preprocessing_method'] = preprocessing_method
-                            results['elapsed_time'] = elapsed
-                            break
-                except Exception as e:
-                    print(f"   ❌ Could not load {result_file.name}: {e}")
-        
-        if warped_color is None:
-            print("   ❌ No usable registration result found")
-            results['success'] = False
-            results['error'] = "No displacement field or warped result found"
-        
-        # Step 6: Create visualizations
-        if warped_color is not None:
-            print("\n6. Creating visualizations...")
-            try:
-                create_visualizations(he_original_color, if_rgb, warped_color, output_dir)
-                print("   ✅ Visualizations created")
+                    flow = disp_field
+                
+                if flow.shape[:2] != (h, w):
+                    flow = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR)
+                
+                x, y = np.meshgrid(np.arange(w), np.arange(h))
+                map_x = (x + flow[:, :, 0]).astype(np.float32)
+                map_y = (y + flow[:, :, 1]).astype(np.float32)
+                
+                warped = cv2.remap(he_original_color, map_x, map_y, cv2.INTER_LINEAR)
+                
+                final_output_path = output_dir / "registered_HE_robust.tiff"
+                tifffile.imwrite(
+                    final_output_path,
+                    warped,
+                    photometric='rgb',
+                    compression='lzw',
+                    bigtiff=True
+                )
+                
+                print(f"   ✅ Applied displacement field successfully")
+                final_result = final_output_path
+                results['method'] = 'displacement_field'
+                break
+                
             except Exception as e:
-                print(f"   Warning: Visualization failed: {e}")
+                print(f"   ❌ Displacement method failed: {e}")
+        
+        # Try warped files method
+        if final_result is None:
+            for warped_file in warped_files:
+                warped = load_image_robust(warped_file)
+                if warped is not None:
+                    final_output_path = output_dir / f"registered_HE_from_{warped_file.stem}.tiff"
+                    tifffile.imwrite(
+                        final_output_path,
+                        warped,
+                        photometric='rgb',
+                        compression='lzw',
+                        bigtiff=True
+                    )
+                    
+                    print(f"   ✅ Used warped file: {warped_file.name}")
+                    final_result = final_output_path
+                    results['method'] = f'warped_file_{warped_file.stem}'
+                    break
+        
+        if final_result:
+            results['success'] = True
+            results['registered_path'] = final_result
+            print(f"   ✅ Final result saved: {final_result}")
+        else:
+            results['success'] = False
+            results['error'] = "No usable output could be generated"
+            print("   ❌ No usable output could be generated")
         
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\n❌ Critical error: {e}")
         import traceback
         traceback.print_exc()
         results['success'] = False
@@ -696,58 +463,23 @@ def register_qptiff_direct_color(he_qptiff_path: Path, if_qptiff_path: Path,
     
     return results
 
-def create_visualizations(he_original, if_img, warped, output_dir):
-    """Create quality check visualizations"""
-    viz_dir = output_dir / "visualizations"
-    viz_dir.mkdir(exist_ok=True)
-    
-    # Ensure all images have same shape
-    h, w = if_img.shape[:2]
-    if he_original.shape[:2] != (h, w):
-        he_original = cv2.resize(he_original, (w, h))
-    if warped.shape[:2] != (h, w):
-        warped = cv2.resize(warped, (w, h))
-    
-    # Side-by-side comparison
-    comparison = np.hstack([he_original, if_img, warped])
-    cv2.imwrite(str(viz_dir / "side_by_side.jpg"), cv2.cvtColor(comparison, cv2.COLOR_RGB2BGR))
-    
-    # Checkerboard overlay
-    checker_size = max(100, min(h, w) // 20)
-    checkerboard = np.zeros_like(if_img)
-    
-    for i in range(0, h, checker_size):
-        for j in range(0, w, checker_size):
-            if (i//checker_size + j//checker_size) % 2 == 0:
-                checkerboard[i:i+checker_size, j:j+checker_size] = warped[i:i+checker_size, j:j+checker_size]
-            else:
-                checkerboard[i:i+checker_size, j:j+checker_size] = if_img[i:i+checker_size, j:j+checker_size]
-    
-    cv2.imwrite(str(viz_dir / "checkerboard.jpg"), cv2.cvtColor(checkerboard, cv2.COLOR_RGB2BGR))
-    
-    # Overlay blend
-    overlay = cv2.addWeighted(if_img, 0.5, warped, 0.5, 0)
-    cv2.imwrite(str(viz_dir / "overlay.jpg"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-    
-    print(f"   ✅ Visualizations saved to: {viz_dir}")
-
 #############################################################################
 # MAIN EXECUTION
 #############################################################################
 
 def main():
-    """Main execution with color support"""
+    """Main execution with robust error handling"""
     import argparse
     
     print("\n" + "="*70)
-    print(" QPTIFF REGISTRATION PIPELINE - COLOR VERSION")
+    print(" ROBUST QPTIFF REGISTRATION PIPELINE")
     print("="*70)
     print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    parser = argparse.ArgumentParser(description="Direct QPTIFF registration with color preservation")
+    parser = argparse.ArgumentParser(description="Robust QPTIFF registration")
     parser.add_argument("--he-qptiff", type=str, required=True, help="Path to H&E QPTIFF")
     parser.add_argument("--if-qptiff", type=str, required=True, help="Path to IF QPTIFF")
-    parser.add_argument("--output-dir", type=str, default="./output", help="Output directory")
+    parser.add_argument("--output-dir", type=str, default="./output_robust", help="Output directory")
     parser.add_argument("--if-channels", type=int, nargs='+', default=[0, 1, 5], 
                        help="IF channels to use (default: 0=DAPI, 1=CD8, 5=CD163)")
     
@@ -778,8 +510,8 @@ def main():
     else:
         print("\n⚠️  No GPU detected - registration will be slower")
     
-    # Run registration with color support
-    results = register_qptiff_direct_color(he_path, if_path, output_dir, args.if_channels)
+    # Run robust registration
+    results = register_qptiff_robust(he_path, if_path, output_dir, args.if_channels)
     
     # Summary
     print("\n" + "="*70)
@@ -788,14 +520,15 @@ def main():
     
     if results.get('success'):
         print(f"✅ Registration completed successfully!")
-        print(f"   Method: {results.get('method', 'displacement_field')}")
-        print(f"   Preprocessing: {results.get('preprocessing_method', 'unknown')}")
-        print(f"   Time: {results.get('elapsed_time', 'unknown'):.1f} seconds")
+        if 'method' in results:
+            print(f"   Method: {results['method']}")
+        if 'elapsed_time' in results:
+            print(f"   Time: {results['elapsed_time']:.1f} seconds")
         print(f"   Output: {results['registered_path']}")
-        if 'output_shape' in results:
-            print(f"   Dimensions: {results['output_shape']}")
     else:
         print(f"❌ Registration failed: {results.get('error', 'Unknown error')}")
+        if 'registration_error' in results:
+            print(f"   DeepHistReg error: {results['registration_error']}")
         return 1
     
     print(f"\nCompleted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
