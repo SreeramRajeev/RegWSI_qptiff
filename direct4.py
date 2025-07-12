@@ -20,6 +20,7 @@ import glob
 ### Scientific Computing ###
 import numpy as np
 import torch as tc
+from scipy.ndimage import map_coordinates
 
 ### Image Processing ###
 import cv2
@@ -252,9 +253,10 @@ def load_displacement_field(filepath):
     else:
         raise ValueError(f"Unsupported displacement field format: {filepath.suffix}")
 
-def apply_displacement_field(image, displacement_field):
+def apply_displacement_field(image, displacement_field, chunk_size=16384):
     """
     Apply displacement field to warp an image
+    Handles large images by processing in chunks to avoid OpenCV size limitations
     """
     h, w = image.shape[:2]
     
@@ -263,18 +265,122 @@ def apply_displacement_field(image, displacement_field):
         print(f"   Resizing displacement field from {displacement_field.shape} to {(h, w, 2)}")
         displacement_field = cv2.resize(displacement_field, (w, h), interpolation=cv2.INTER_LINEAR)
     
+    # Check if image is too large for OpenCV (SHRT_MAX = 32767)
+    max_opencv_size = 32767
+    
+    if h <= max_opencv_size and w <= max_opencv_size:
+        # Small enough for direct processing
+        print(f"   Applying displacement field directly (size: {h}x{w})")
+        return _apply_displacement_direct(image, displacement_field)
+    else:
+        # Too large - use chunked processing
+        print(f"   Image too large for OpenCV direct processing ({h}x{w})")
+        print(f"   Using chunked processing with chunk size: {chunk_size}")
+        return _apply_displacement_chunked(image, displacement_field, chunk_size)
+
+def _apply_displacement_direct(image, displacement_field):
+    """Direct application for smaller images"""
+    h, w = image.shape[:2]
+    
     # Create coordinate maps
     x, y = np.meshgrid(np.arange(w), np.arange(h))
     map_x = (x + displacement_field[:, :, 0]).astype(np.float32)
     map_y = (y + displacement_field[:, :, 1]).astype(np.float32)
     
     # Apply warping
+    warped = cv2.remap(image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    return warped
+
+def _apply_displacement_chunked(image, displacement_field, chunk_size):
+    """Chunked processing for large images"""
+    h, w = image.shape[:2]
+    
+    # Create output array
     if image.ndim == 3:
-        warped = cv2.remap(image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        warped = np.zeros_like(image)
     else:
-        warped = cv2.remap(image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        warped = np.zeros_like(image)
+    
+    # Calculate number of chunks
+    h_chunks = (h + chunk_size - 1) // chunk_size
+    w_chunks = (w + chunk_size - 1) // chunk_size
+    
+    print(f"   Processing in {h_chunks}x{w_chunks} = {h_chunks * w_chunks} chunks")
+    
+    # Process each chunk
+    for i in range(h_chunks):
+        for j in range(w_chunks):
+            # Calculate chunk boundaries
+            h_start = i * chunk_size
+            h_end = min((i + 1) * chunk_size, h)
+            w_start = j * chunk_size
+            w_end = min((j + 1) * chunk_size, w)
+            
+            if (i * w_chunks + j) % 10 == 0:  # Progress indicator
+                print(f"   Processing chunk {i * w_chunks + j + 1}/{h_chunks * w_chunks}")
+            
+            # Extract displacement chunk
+            disp_chunk = displacement_field[h_start:h_end, w_start:w_end]
+            
+            # Create coordinate grids for this chunk
+            chunk_h, chunk_w = disp_chunk.shape[:2]
+            y_coords, x_coords = np.mgrid[h_start:h_end, w_start:w_end]
+            
+            # Apply displacement to get sampling coordinates
+            sample_x = x_coords + disp_chunk[:, :, 0]
+            sample_y = y_coords + disp_chunk[:, :, 1]
+            
+            # Clamp coordinates to image boundaries
+            sample_x = np.clip(sample_x, 0, w - 1)
+            sample_y = np.clip(sample_y, 0, h - 1)
+            
+            # Sample from the full image at these coordinates
+            try:
+                warped_chunk = _sample_image_at_coordinates(image, sample_x, sample_y)
+                warped[h_start:h_end, w_start:w_end] = warped_chunk
+                
+            except Exception as e:
+                print(f"   Warning: Error processing chunk ({i},{j}): {e}")
+                # Fall back to copying original chunk
+                warped[h_start:h_end, w_start:w_end] = image[h_start:h_end, w_start:w_end]
     
     return warped
+
+def _sample_image_at_coordinates(image, map_x, map_y):
+    """
+    Sample image at given coordinates using bilinear interpolation
+    Alternative to cv2.remap for when coordinates are already computed
+    """
+    h, w = image.shape[:2]
+    
+    # Flatten coordinates for map_coordinates
+    coords_y = map_y.flatten()
+    coords_x = map_x.flatten()
+    
+    if image.ndim == 3:
+        # Color image
+        result = np.zeros((map_y.size, image.shape[2]), dtype=image.dtype)
+        for c in range(image.shape[2]):
+            result[:, c] = map_coordinates(
+                image[:, :, c], 
+                [coords_y, coords_x], 
+                order=1,  # Linear interpolation
+                mode='reflect',
+                prefilter=False
+            )
+        result = result.reshape(map_y.shape + (image.shape[2],))
+    else:
+        # Grayscale image
+        result = map_coordinates(
+            image, 
+            [coords_y, coords_x], 
+            order=1,  # Linear interpolation
+            mode='reflect',
+            prefilter=False
+        )
+        result = result.reshape(map_y.shape)
+    
+    return result.astype(image.dtype)
 
 #############################################################################
 # MAIN REGISTRATION FUNCTION
@@ -282,7 +388,7 @@ def apply_displacement_field(image, displacement_field):
 
 def register_qptiff_color_direct(he_qptiff_path: Path, if_qptiff_path: Path, 
                                 output_dir: Path, if_channels: list = None, 
-                                use_color: bool = True) -> Dict:
+                                use_color: bool = True, chunk_size: int = 16384) -> Dict:
     """
     Register H&E to IF QPTIFF directly at full resolution using color
     
@@ -426,7 +532,7 @@ def register_qptiff_color_direct(he_qptiff_path: Path, if_qptiff_path: Path,
                 print(f"   Displacement field shape: {displacement_field.shape}")
                 
                 # Apply to original H&E image
-                warped_he = apply_displacement_field(he_data, displacement_field)
+                warped_he = apply_displacement_field(he_data, displacement_field, chunk_size)
                 
                 # Save final result
                 final_output_path = output_dir / f"registered_HE_{'color' if use_color else 'enhanced'}.tiff"
@@ -578,6 +684,8 @@ def main():
                        help="Use color registration (default: True)")
     parser.add_argument("--use-grayscale", action='store_true', default=False,
                        help="Force grayscale registration")
+    parser.add_argument("--chunk-size", type=int, default=16384,
+                       help="Chunk size for large image processing (default: 16384)")
     
     args = parser.parse_args()
     
@@ -614,7 +722,7 @@ def main():
         print("\n⚠️  SimpleITK not available - install with 'pip install SimpleITK' for .mha support")
     
     # Run registration
-    results = register_qptiff_color_direct(he_path, if_path, output_dir, args.if_channels, use_color)
+    results = register_qptiff_color_direct(he_path, if_path, output_dir, args.if_channels, use_color, args.chunk_size)
     
     # Summary
     print("\n" + "="*70)
