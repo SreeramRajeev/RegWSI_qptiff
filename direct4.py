@@ -393,12 +393,12 @@ def try_alternative_displacement_extraction(reg_dir, temp_dir, case_name):
     return warped_files
 
 
-                try:
-                    # This would require SimpleITK or similar
-                    print(f"   Found displacement field in {ext} format: {disp_file.name}")
-                    return disp_file
-                except Exception as e:
-                    print(f"   Could not load {disp_file.name}: {e}")
+    try:
+                # This would require SimpleITK or similar
+        print(f"   Found displacement field in {ext} format: {disp_file.name}")
+        return disp_file
+    except Exception as e:
+        print(f"   Could not load {disp_file.name}: {e}")
     
     return None
 
